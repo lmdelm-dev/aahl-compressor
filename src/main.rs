@@ -1,6 +1,8 @@
 mod aahl;
 mod arith;
+mod bench;
 mod binning;
+mod corpus;
 mod grammar;
 mod spectral;
 
@@ -40,7 +42,22 @@ enum Cmd {
     /// Extract archive
     Extract { archive: PathBuf, out_dir: PathBuf },
     /// Report per-mode block sizes for a single file (dev/diagnostic)
-    Bench { input: PathBuf, #[arg(long)] sweep: bool },
+    #[command(name = "blocksize")]
+    BlockSize { input: PathBuf, #[arg(long)] sweep: bool },
+    /// Build the standard benchmark corpus set (deterministic)
+    #[command(name = "corpus")]
+    BuildCorpus {
+        set_dir: PathBuf,
+        #[arg(long)]
+        source: Option<PathBuf>,
+    },
+    /// Run the benchmark suite over a corpus set, incl. reference tools
+    #[command(name = "bench")]
+    RunBench {
+        set_dir: PathBuf,
+        #[arg(long, default_value = "bench_results.tsv")]
+        tsv: PathBuf,
+    },
 }
 
 struct ChunkMeta {
@@ -433,7 +450,7 @@ fn main() -> Result<()> {
         } => cmd_create(&archive, &inputs, chunk_size),
         Cmd::List { archive } => cmd_list(&archive),
         Cmd::Extract { archive, out_dir } => cmd_extract(&archive, &out_dir),
-        Cmd::Bench { input, sweep } => {
+        Cmd::BlockSize { input, sweep } => {
             let data = std::fs::read(&input).with_context(|| format!("read {}", input.display()))?;
             let (folded, arith, o1t, o1b, final_len, raw, mode) = aahl::block_sizes(&data);
             let best = final_len.min(raw);
@@ -469,6 +486,11 @@ fn main() -> Result<()> {
                     }
                 }
             }
+            Ok(())
+        }
+        Cmd::BuildCorpus { set_dir, source } => corpus::build_corpus(&set_dir, source.as_deref()),
+        Cmd::RunBench { set_dir, tsv } => {
+            bench::run_bench(&set_dir, &tsv)?;
             Ok(())
         }
     }
