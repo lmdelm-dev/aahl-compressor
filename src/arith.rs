@@ -433,6 +433,41 @@ impl PersistentTokenModel {
         self.n = n2;
     }
 
+    /// GC shrink: drop the dead grammar history by truncating the alphabet to
+    /// `n2` (>= 256). Literal symbols (< 256) keep their accumulated counts
+    /// everywhere; surviving rule symbols are *re-added* with the count-1 prior
+    /// (frequency history is forgotten, the rule definitions are not — they
+    /// live in grammar.rs). Every tree is rebuilt exactly from the counts rows
+    /// so the encoder and decoder converge byte-identically: both sides run
+    /// shrink_alphabet with the same n2 at the same chunk boundary.
+    pub fn shrink_alphabet(&mut self, n2: usize) {
+        assert!((256..=MAX_SYMS).contains(&n2));
+        if n2 >= self.n {
+            return;
+        }
+        for row in self.counts.iter_mut() {
+            for i in 256..n2 {
+                row[i] = 1;
+            }
+            row.truncate(n2);
+        }
+        let counts = &self.counts;
+        for (c, (fw, tot)) in self.fw.iter_mut().zip(self.total.iter_mut()).enumerate() {
+            let row = &counts[c];
+            let mut nfw = Fenwick::zeros(MAX_SYMS);
+            let mut sum = 0u64;
+            for i in 0..n2 {
+                nfw.add(i, row[i]);
+            }
+            for v in &row[..n2] {
+                sum += v;
+            }
+            *fw = nfw;
+            *tot = sum;
+        }
+        self.n = n2;
+    }
+
     /// Start of a new chunk: reset the context to the sentinel (first-token)
     /// and begin a fresh transaction log for this chunk's tokens.
     pub fn begin_chunk(&mut self) {

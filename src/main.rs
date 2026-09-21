@@ -35,7 +35,7 @@ const PARAM_GC_DEFAULT: u64 = 64;
 const PARAM_RULES_DEFAULT: u64 = 60000;
 // v3 record framing: kind u8 | body_len u32 | body
 const RECORD_DATA: u8 = 0x01; // body = blake3[32] | unpacked_len u32 | packed bytes
-const RECORD_GC: u8 = 0x02; // reserved (Phase 2 GC records; never emitted in P1)
+const RECORD_GC: u8 = 0x02; // body = flags u8 | num_survivors u32 | survivor u32* (grammar GC)
 const STORE_VERSION: u16 = 1;
 const STORE_MODE: u16 = 0; // single raw container, no grammar
 
@@ -89,6 +89,14 @@ struct FileEntry {
     path: String,
     file_len: u64,
     refs: Vec<u32>,
+}
+
+/// A grammar-GC record interleaved between DATA records. `data_before` is the
+/// count of DATA records that precede it in the stream, so extraction applies
+/// the remap at exactly the right grammar state.
+struct GcRecord {
+    data_before: u32,
+    survivors: Vec<u32>,
 }
 
 fn write_u16(w: &mut impl Write, v: u16) -> Result<()> {
@@ -192,13 +200,23 @@ fn visit_dir(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) -> Resul
 }
 
 fn cmd_create(archive: &Path, inputs: &[PathBuf], chunk_size: u32) -> Result<()> {
+    cmd_create_params(
+        archive,
+        inputs,
+        chunk_size,
+        pack_params(PARAM_LAG_DEFAULT, PARAM_GC_DEFAULT, PARAM_RULES_DEFAULT, 0),
+    )
+}
+
+/// Full create path with explicit params (tests inject a short GC interval to
+/// force grammar reclamation deterministically; the CLI uses defaults).
+fn cmd_create_params(archive: &Path, inputs: &[PathBuf], chunk_size: u32, params: u64) -> Result<()> {
     if !(4096..=1_048_576).contains(&chunk_size) {
         bail!("chunk-size must be 4KiB..1MiB (fold is O(n*m), keep small)");
     }
     let files = collect_files(inputs)?;
     let mut out = File::create(archive).with_context(|| format!("create {}", archive.display()))?;
 
-    let params = pack_params(PARAM_LAG_DEFAULT, PARAM_GC_DEFAULT, PARAM_RULES_DEFAULT, 0);
     // 20-byte v3 prefix: magic(4) | version u16 | flags u16 | chunk_size u32 | params u64
     let mut prefix = [0u8; 20];
     prefix[..4].copy_from_slice(MAGIC_HDR);
@@ -215,7 +233,13 @@ fn cmd_create(archive: &Path, inputs: &[PathBuf], chunk_size: u32) -> Result<()>
     // One persistent grammar owns the whole archive; it advances only for
     // chunks that actually get emitted (DATA records). Dedup-skipped pieces
     // are never encoded, so they never touch it — the decoder never re-reads them.
-    let mut grammar = grammar::PersistentGrammar::default();
+    // The params gc_interval drives how often it tries to reclaim dead rule
+    // history (each GC attempt costs a checkpoint of the live set).
+    let (_, gc_interval, _, _) = unpack_params(params);
+    let mut grammar = grammar::PersistentGrammar::with_gc(
+        aahl::FoldConfig::default(),
+        gc_interval as usize,
+    );
 
     for (arc_name, disk_path) in &files {
         let data =
@@ -229,7 +253,7 @@ fn cmd_create(archive: &Path, inputs: &[PathBuf], chunk_size: u32) -> Result<()>
                     continue;
                 }
                 // AAHL core: custom fold codec + persistent grammar, NOT zstd/LZ.
-                let packed = grammar.compress(piece);
+                let (packed, pending_gc) = grammar.compress(piece);
                 let idx = chunks.len() as u32;
                 // v3 DATA record: kind u8 | body_len u32 | hash(32) | unpacked_len u32 | packed
                 out.write_all(&[RECORD_DATA])?;
@@ -239,6 +263,11 @@ fn cmd_create(archive: &Path, inputs: &[PathBuf], chunk_size: u32) -> Result<()>
                 write_u32(&mut out, piece.len() as u32)?;
                 let data_off = out.stream_position()?;
                 out.write_all(&packed)?;
+                // Grammar GC records interleave between DATA records; they
+                // apply before the next chunk's decode.
+                if let Some(gc) = pending_gc {
+                    out.write_all(&gc)?;
+                }
                 chunk_index.insert(hash, idx);
                 chunks.push(ChunkMeta {
                     hash,
@@ -354,6 +383,7 @@ struct ArchiveIndex {
     files: Vec<FileEntry>,
     store_mode: bool,
     store_payload: u64, // STORE: byte offset where the raw payload begins
+    gcs: Vec<GcRecord>, // v3 grammar-GC records in stream order
 }
 
 fn read_u8(r: &mut impl Read) -> Result<u8> {
@@ -427,15 +457,19 @@ fn open_index(archive: &Path) -> Result<(File, ArchiveIndex)> {
 
     // Chunk region. v1/v2 use a fixed [hash|unpacked|packed|packed] table;
     // v3 uses record framing: kind u8 | body_len u32 | body. DATA records
-    // carry compressed chunks; GC records are validated and skipped.
+    // carry compressed chunks; GC records are parsed, validated and stored
+    // in stream order so extraction can apply them at the right boundary.
     let mut chunks = Vec::with_capacity(num_chunks);
+    let mut gcs: Vec<GcRecord> = Vec::new();
     f.seek(SeekFrom::Start(header_len))?;
     if ver >= 3 {
+        let mut data_seen = 0u32;
         while f.stream_position()? < table_offset {
             let kind = read_u8(&mut f)?;
             let body_len = read_u32(&mut f)? as u64;
             match kind {
                 RECORD_DATA => {
+                    data_seen += 1;
                     let mut hash = [0u8; 32];
                     f.read_exact(&mut hash)?;
                     let unpacked = read_u32(&mut f)?;
@@ -453,7 +487,14 @@ fn open_index(archive: &Path) -> Result<(File, ArchiveIndex)> {
                     });
                 }
                 RECORD_GC => {
-                    f.seek(SeekFrom::Current(body_len as i64))?;
+                    let mut body = vec![0u8; body_len as usize];
+                    f.read_exact(&mut body)?;
+                    let survivors = grammar::PersistentGrammar::parse_gc_body(&body)
+                        .with_context(|| format!("bad GC record at {data_seen}"))?;
+                    gcs.push(GcRecord {
+                        data_before: data_seen,
+                        survivors,
+                    });
                 }
                 _ => bail!("unknown record kind {kind}"),
             }
@@ -511,6 +552,7 @@ fn open_index(archive: &Path) -> Result<(File, ArchiveIndex)> {
             files,
             store_mode: false,
             store_payload: 0,
+            gcs,
         },
     ))
 }
@@ -580,6 +622,7 @@ fn open_store(mut f: File, flen: u64) -> Result<(File, ArchiveIndex)> {
             files,
             store_mode: true,
             store_payload,
+            gcs: Vec::new(),
         },
     ))
 }
@@ -646,11 +689,18 @@ fn cmd_extract(archive: &Path, out_dir: &Path) -> Result<()> {
 
     // v2/v3 persistent grammar: chunk decode order is the honest contract, so
     // decode every chunk once in index order through a single grammar and
-    // serve the file references from the full cache.
+    // serve the file references from the full cache. GC records interleaved
+    // with DATA records retarget the grammar before the next chunk.
     let ordered_cache: HashMap<u32, Vec<u8>> = if idx.flags & FLAG_GLOBAL != 0 {
         let mut g = grammar::PersistentGrammar::default();
         let mut cache: HashMap<u32, Vec<u8>> = HashMap::with_capacity(idx.chunks.len());
+        let mut gci = 0usize;
         for (i, meta) in idx.chunks.iter().enumerate() {
+            while gci < idx.gcs.len() && (idx.gcs[gci].data_before as usize) == i {
+                g.apply_gc(&idx.gcs[gci].survivors)
+                    .with_context(|| format!("GC before chunk {i}"))?;
+                gci += 1;
+            }
             let raw = read_chunk_grammar(&mut f, meta, &mut g)?;
             cache.insert(i as u32, raw);
         }
@@ -928,7 +978,7 @@ let (_f, idx) = open_index(&arc).unwrap();
         let _ = std::fs::write(&arc, good); // leave good archive for later tests
     }
 
-    #[test]
+#[test]
     fn empty_file_roundtrip_and_store_bound() {
         let dir = scratch("empty");
         let src = dir.join("e.txt");
@@ -942,6 +992,115 @@ let (_f, idx) = open_index(&arc).unwrap();
         let outd = dir.join("ex");
         cmd_extract(&arc, &outd).unwrap();
         assert_eq!(std::fs::read(outd.join("e.txt")).unwrap(), b"");
+    }
+
+    #[test]
+    fn gc_records_in_archive_apply_and_roundtrip() {
+        let dir = scratch("gcs");
+        let src = dir.join("osc.txt");
+        let data = oscillating_text();
+        write_file(&src, &data);
+        let arc = dir.join("gcs.aahl");
+        // gc_interval=8 forces grammar reclamation mid-archive
+        cmd_create_params(
+            &arc,
+            &[src.clone()],
+            4096,
+            pack_params(PARAM_LAG_DEFAULT, 8, PARAM_RULES_DEFAULT, 0),
+        )
+        .unwrap();
+
+        let (_f, idx) = open_index(&arc).unwrap();
+        assert!(!idx.store_mode);
+        assert!(
+            !idx.gcs.is_empty(),
+            "oscillating content must emit GC records"
+        );
+        for g in &idx.gcs {
+            assert!(g.data_before >= 1, "GC must interleave after DATA records");
+            assert!(g.survivors.len() >= 2, "GC must keep at least 2 rules");
+        }
+
+        let outd = dir.join("extracted");
+        cmd_extract(&arc, &outd).unwrap();
+        let got = std::fs::read(outd.join("osc.txt").as_path()).unwrap();
+        assert_eq!(got, data, "roundtrip mismatch across GC boundaries");
+    }
+
+    #[test]
+    fn corrupt_gc_record_bodies_are_rejected_not_panicked() {
+        let dir = scratch("gcscorrupt");
+        let src = dir.join("osc.txt");
+        let data = oscillating_text();
+        write_file(&src, &data);
+        let arc = dir.join("gcs.aahl");
+        cmd_create_params(
+            &arc,
+            &[src.clone()],
+            4096,
+            pack_params(PARAM_LAG_DEFAULT, 8, PARAM_RULES_DEFAULT, 0),
+        )
+        .unwrap();
+
+        let bytes = std::fs::read(&arc).unwrap();
+        let good = bytes.clone();
+        // find the first GC record via the same record-framing walk
+        let table_offset =
+            u64::from_le_bytes(good[good.len() - 32..good.len() - 24].try_into().unwrap());
+        let mut pos: usize = HEADER_LEN_V3 as usize;
+        let mut gc_body = None;
+        while pos + 5 <= table_offset as usize {
+            let kind = good[pos];
+            let blen =
+                u32::from_le_bytes(good[pos + 1..pos + 5].try_into().unwrap()) as usize;
+            if kind == RECORD_GC {
+                gc_body = Some(pos + 5); // body starts at flags byte
+            }
+            pos += 5 + blen;
+        }
+        let gc_body = gc_body.expect("archive must contain a GC record");
+        // sanity: good archive parses
+        assert!(open_index(&arc).is_ok());
+
+        // flip the flags byte -> parse_gc_body rejects; open_index must Err
+        let mut tampered = good.clone();
+        tampered[gc_body] ^= 0x01;
+        let p = dir.join("badflags.aahl");
+        std::fs::write(&p, &tampered).unwrap();
+        assert!(
+            open_index(&p).is_err(),
+            "nonzero GC flags must be rejected"
+        );
+
+        // shrink a survivor list (more survivors than body conveys) -> Err
+        let mut tampered = good.clone();
+        tampered[gc_body + 5] ^= 0xFF; // num_survivors low byte
+        let p = dir.join("badcount.aahl");
+        std::fs::write(&p, &tampered).unwrap();
+        assert!(
+            open_index(&p).is_err(),
+            "GC survivor count mismatch must be rejected"
+        );
+    }
+
+    fn oscillating_text() -> Vec<u8> {
+        // alternate two idioms every 16 windows so live rules die by the next
+        // window and every DATA record is unique (no dedup collapse)
+        let mut data = Vec::new();
+        for i in 0..64 {
+            let idiom = if i % 16 < 8 { "alpha" } else { "beta" };
+            let mut chunk = String::new();
+            while chunk.len() < 4096 {
+                chunk.push_str(&format!(
+                    "pub fn {idiom}_{i:03}_t{}() -> u64 {{ let s = {}u64.wrapping_mul(97).wrapping_add({}); s ^ s >> 11; s }}\n",
+                    chunk.len() % 7,
+                    i,
+                    i
+                ));
+            }
+            data.extend_from_slice(chunk.as_bytes());
+        }
+        data
     }
 
     #[test]
