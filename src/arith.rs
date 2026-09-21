@@ -115,10 +115,14 @@ impl Fenwick {
         Self { n, tree: vec![0u64; n] }
     }
 
+    /// Apply a signed delta to the count at `idx`. `delta` is `u64` so that
+    /// negative adjustments can be expressed as wraparound (`u64::MAX == -1`);
+    /// `wrapping_add` makes that contract hold in debug builds too, where plain
+    /// `+=` would panic on overflow even though the value is logically valid.
     pub fn add(&mut self, idx: usize, delta: u64) {
         let mut i = idx + 1;
         while i <= self.n {
-            self.tree[i - 1] += delta;
+            self.tree[i - 1] = self.tree[i - 1].wrapping_add(delta);
             i += i & i.wrapping_neg();
         }
     }
