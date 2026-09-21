@@ -541,6 +541,280 @@ impl PersistentTokenModel {
     }
 }
 
+// ---------- Deterministic partial-order blending ----------
+//
+// Context mixing adds nothing to the *frame*; it only refines the probability
+// model. This module implements a lightweight, deterministic blend of two
+// contexts: the exact order-1 context (previous token, literals + rule
+// buckets) and a partial order-2 "sparse" context (the previous two tokens
+// hashed into O2_BUCKETS buckets). Each bucket learns independently *which*
+// context predicts better via a win counter, so after a short warmup the
+// better context wins per-bucket without any non-determinism: both sides walk
+// the same token stream, so the counters converge identically. This maps
+// directly from the research survey (PMC-style -- never reset models across
+// blocks; blend high-order contexts with a fallback to lower-order evidence)
+// while keeping the integer-only, byte-exact determinism contract.
+
+const O2_BUCKETS: usize = 1024;
+#[allow(dead_code)]
+const O2_MIN_TOTAL: u64 = 4; // order-2 must have evidence before it may win
+
+#[allow(dead_code)] // used by unit tests; wired into the persistent model in a later phase
+fn o2_bucket(prev: u16, prev2: u16) -> usize {
+    let h = (prev as u32) as u64 * 0x9E37_79B9
+        ^ (prev2 as u32) as u64 * 0xBF58_476D;
+    (h % O2_BUCKETS as u64) as usize
+}
+
+/// Encoder half of the deterministic blend model. Writes arithmetic-coded
+/// bytes via `encode_step`, exactly like `encode_tokens_order1`, but orders
+/// each token's probability from a mix of the order-1 context and the
+/// order-2 bucket context.
+#[allow(dead_code)] // unit-test only; wired into the persistent model in a later phase
+pub struct BlendEncoder {
+    n: usize,
+    // order-1: full adaptive tables (TOKEN_NC contexts x alphabet)
+    counts: Vec<Vec<u64>>,
+    fw: Vec<Fenwick>,
+    total: Vec<u64>,
+    // order-2: per-bucket adaptive tables (lazily allocated)
+    o2_counts: Vec<Vec<u64>>,
+    o2_fw: Vec<Fenwick>,
+    o2_total: Vec<u64>,
+    o2_active: Vec<u64>, // 0 = no evidence, else current O2 total per bucket
+    wins_o1: Vec<u64>,
+    wins_o2: Vec<u64>,
+    ctx: usize,
+    prev: u16,
+    prev2: u16,
+}
+
+#[allow(dead_code)] // unit-test only; wired into the persistent model in a later phase
+impl BlendEncoder {
+    pub fn new(n: usize) -> Self {
+        assert!((2..=MAX_SYMS).contains(&n));
+        let nc = TOKEN_NC;
+        let counts = vec![vec![1u64; n]; nc];
+        let fw: Vec<Fenwick> = (0..nc).map(|_| fenwick_ones(n)).collect();
+        let total = vec![n as u64; nc];
+        let o2_counts = vec![Vec::new(); O2_BUCKETS];
+        let o2_fw = (0..O2_BUCKETS).map(|_| Fenwick::zeros(0)).collect();
+        let o2_total = vec![0u64; O2_BUCKETS];
+        let o2_active = vec![0u64; O2_BUCKETS];
+        let wins_o1 = vec![0u64; O2_BUCKETS];
+        let wins_o2 = vec![0u64; O2_BUCKETS];
+        Self {
+            n,
+            counts,
+            fw,
+            total,
+            o2_counts,
+            o2_fw,
+            o2_total,
+            o2_active,
+            wins_o1,
+            wins_o2,
+            ctx: TOKEN_SENTINEL,
+            prev: TOKEN_SENTINEL as u16,
+            prev2: TOKEN_SENTINEL as u16,
+        }
+    }
+
+    /// Grow alphabets so the model is printable/decodable on both sides.
+    pub fn grow(&mut self, n2: usize) {
+        if n2 <= self.n {
+            return;
+        }
+        // Rebuild each order-1 tree from its (resized) count row; new symbols
+        // default to the count-1 prior so no probability ever goes stale.
+        for (c, fw) in self.fw.iter_mut().enumerate() {
+            self.counts[c].resize(n2, 1);
+            let mut nw = Fenwick::zeros(MAX_SYMS);
+            for i in 0..n2 {
+                nw.add(i, self.counts[c][i]);
+            }
+            *fw = nw;
+            self.total[c] += (n2 - self.n) as u64;
+        }
+        for (row, fw) in self.o2_counts.iter_mut().zip(self.o2_fw.iter_mut()) {
+            if !row.is_empty() {
+                row.resize(n2, 1);
+                let mut nw = Fenwick::zeros(MAX_SYMS);
+                for i in 0..n2 {
+                    nw.add(i, row[i]);
+                }
+                *fw = nw;
+            }
+        }
+        self.n = n2;
+    }
+
+    /// Encode one token against the current blended context.
+    pub fn encode_token(&mut self, token: u16, enc: &mut Encoder) {
+        let s = token as usize;
+        debug_assert!(s < self.n);
+        let c = self.ctx; // order-1 context
+
+        // Probability from the order-1 table.
+        let o1_start = self.fw[c].prefix(s);
+        let o1_size = self.counts[c][s];
+        let o1_total = self.total[c];
+
+        // Order-2 candidate (if this bucket has evidence).
+        let bucket = o2_bucket(self.prev, self.prev2);
+        let o2_total = self.o2_total[bucket];
+
+        // Deterministic per-bucket winner based on accumulated wins.
+        let use_o2 = o2_total >= O2_MIN_TOTAL && self.wins_o2[bucket] > self.wins_o1[bucket];
+
+        if use_o2 {
+            let start = self.o2_fw[bucket].prefix(s);
+            let size = self.o2_counts[bucket][s];
+            enc.encode_step(start, size, o2_total);
+        } else {
+            enc.encode_step(o1_start, o1_size, o1_total);
+        }
+
+        // Update both models (order-2 bucket only once warm).
+        self.counts[c][s] += 1;
+        self.fw[c].add(s, 1);
+        self.total[c] += 1;
+        if self.o2_active[bucket] > 0 {
+            self.o2_counts[bucket][s] += 1;
+            self.o2_fw[bucket].add(s, 1);
+            self.o2_total[bucket] += 1;
+        }
+
+        // Credit whichever model would have assigned the token the most
+        // probability (integer-only comparison, order-independent: both sides
+        // see identical counts, so the decision is identical).
+        //
+        // Compare p_o2(s)/total_o2 vs p_o1(s)/total_o1 by cross-multiplication,
+        // evaluated at the post-update state on BOTH sides.
+        if self.o2_active[bucket] > 0 {
+            let p_o2 = self.o2_counts[bucket][s] * self.total[c];
+            let p_o1 = self.counts[c][s] * self.o2_total[bucket];
+            if p_o1 > p_o2 {
+                self.wins_o1[bucket] = self.wins_o1[bucket].wrapping_add(1);
+            } else {
+                self.wins_o2[bucket] = self.wins_o2[bucket].wrapping_add(1);
+            }
+        } else {
+            // Both cold: teach the bucket so it can start competing.
+            // Lazily initialize the order-2 table for this bucket.
+            if self.o2_active[bucket] == 0 {
+                self.o2_counts[bucket] = vec![1u64; self.n];
+                self.o2_fw[bucket] = fenwick_ones(self.n);
+                self.o2_total[bucket] = self.n as u64;
+                self.o2_active[bucket] = 1;
+            }
+            self.o2_counts[bucket][s] += 1;
+            self.o2_fw[bucket].add(s, 1);
+            self.o2_total[bucket] += 1;
+            self.wins_o1[bucket] = self.wins_o1[bucket].wrapping_add(1);
+        }
+
+        self.prev2 = self.prev;
+        self.prev = token;
+        self.ctx = token_ctx(s, self.n);
+    }
+}
+
+/// Encode a token stream with the deterministic blend model.
+#[allow(dead_code)] // unit-test only; wired into the persistent model in a later phase
+pub fn encode_tokens_blend(tokens: &[u16], n: usize) -> Vec<u8> {
+    let mut model = BlendEncoder::new(n);
+    let mut enc = Encoder::new();
+    for &t in tokens {
+        model.encode_token(t, &mut enc);
+    }
+    enc.flush()
+}
+
+/// Decode a token stream produced by `encode_tokens_blend`.
+#[allow(dead_code)] // unit-test only; wired into the persistent model in a later phase
+pub fn decode_tokens_blend(
+    buf: &[u8],
+    n: usize,
+    num_tokens: usize,
+    out: &mut Vec<u16>,
+) -> Result<(), String> {
+    if n == 0 || n > MAX_SYMS {
+        return Err("bad alphabet size".into());
+    }
+    let mut model = BlendEncoder::new(n);
+    let mut dec = Decoder::new(buf);
+    for _ in 0..num_tokens {
+        let c = model.ctx;
+        let bucket = o2_bucket(model.prev, model.prev2);
+        let o2_total = model.o2_total[bucket];
+        let use_o2 = o2_total >= O2_MIN_TOTAL && model.wins_o2[bucket] > model.wins_o1[bucket];
+        let s = if use_o2 {
+            let t = o2_total;
+            let th = dec.threshold(t);
+            if th >= t {
+                return Err("threshold out of range".into());
+            }
+            let s = model.o2_fw[bucket].find_gt(th);
+            if s >= n {
+                return Err("symbol out of range".into());
+            }
+            let start = model.o2_fw[bucket].prefix(s);
+            let size = model.o2_counts[bucket][s];
+            dec.decode_step(start, size, t);
+            s
+        } else {
+            let t = model.total[c];
+            let th = dec.threshold(t);
+            if th >= t {
+                return Err("threshold out of range".into());
+            }
+            let s = model.fw[c].find_gt(th);
+            if s >= n {
+                return Err("symbol out of range".into());
+            }
+            let start = model.fw[c].prefix(s);
+            let size = model.counts[c][s];
+            dec.decode_step(start, size, t);
+            s
+        };
+        out.push(s as u16);
+        // Mirror the encoder's model updates exactly.
+        model.counts[c][s] += 1;
+        model.fw[c].add(s, 1);
+        model.total[c] += 1;
+        if model.o2_active[bucket] > 0 {
+            model.o2_counts[bucket][s] += 1;
+            model.o2_fw[bucket].add(s, 1);
+            model.o2_total[bucket] += 1;
+        }
+        if model.o2_active[bucket] > 0 {
+            let p_o2 = model.o2_counts[bucket][s] * model.total[c];
+            let p_o1 = model.counts[c][s] * model.o2_total[bucket];
+            if p_o1 > p_o2 {
+                model.wins_o1[bucket] = model.wins_o1[bucket].wrapping_add(1);
+            } else {
+                model.wins_o2[bucket] = model.wins_o2[bucket].wrapping_add(1);
+            }
+        } else {
+            if model.o2_active[bucket] == 0 {
+                model.o2_counts[bucket] = vec![1u64; n];
+                model.o2_fw[bucket] = fenwick_ones(n);
+                model.o2_total[bucket] = n as u64;
+                model.o2_active[bucket] = 1;
+            }
+            model.o2_counts[bucket][s] += 1;
+            model.o2_fw[bucket].add(s, 1);
+            model.o2_total[bucket] += 1;
+            model.wins_o1[bucket] = model.wins_o1[bucket].wrapping_add(1);
+        }
+        model.prev2 = model.prev;
+        model.prev = s as u16;
+        model.ctx = token_ctx(s, model.n);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -687,5 +961,105 @@ mod tests {
         let mut tok: Vec<u16> = (256..300).collect();
         tok.extend((256..300).rev());
         o1t_roundtrip(&tok, n);
+    }
+
+    fn blend_roundtrip(tokens: &[u16], n: usize) {
+        let mut out = Vec::new();
+        let buf = encode_tokens_blend(tokens, n);
+        decode_tokens_blend(&buf, n, tokens.len(), &mut out).expect("blend decode");
+        assert_eq!(out, tokens);
+    }
+
+    #[test]
+    fn blend_empty_and_small_roundtrip() {
+        blend_roundtrip(&[], 2);
+        blend_roundtrip(&[0u16, 1, 0, 1], 2);
+        blend_roundtrip(&[0u16, 255, 256, 1], 300);
+    }
+
+    #[test]
+    fn blend_large_cyclic_roundtrip() {
+        let n = 300;
+        let mut tok: Vec<u16> = Vec::new();
+        for i in 0..5000 {
+            tok.push((i % 10) as u16);
+        }
+        for i in 0..2000 {
+            tok.push(256 + (i % 44));
+        }
+        blend_roundtrip(&tok, n);
+    }
+
+    #[test]
+    fn blend_is_deterministic() {
+        let n = 300;
+        let mut tok: Vec<u16> = Vec::new();
+        for i in 0..3000 {
+            tok.push((i * 7) % 300);
+        }
+        let a = encode_tokens_blend(&tok, n);
+        let b = encode_tokens_blend(&tok, n);
+        assert_eq!(a, b, "blend encode must be byte-deterministic");
+    }
+
+    #[test]
+    fn blend_beats_order1_on_two_back_pattern() {
+        // Stream where the next token depends on TWO tokens back: rows cycle
+        // 0..8, each row is followed by a separator then a value decided by
+        // the row (even -> 1, odd -> 2). Order-1 sees separator->{{1,2}}
+        // (ambiguous), order-2 sees the (row, sep) pair and disambiguates.
+        let n = 300;
+        let mut tok: Vec<u16> = Vec::new();
+        for i in 0..60_000u32 {
+            let row = (i % 8) as u16;
+            tok.push(row);
+            tok.push(100u16);
+            tok.push(if row % 2 == 0 { 1 } else { 2 });
+            tok.push(99u16);
+        }
+        let o1 = encode_tokens_order1(&tok, n).len();
+        let blend = encode_tokens_blend(&tok, n).len();
+        assert!(
+            blend < o1,
+            "expected blend ({}) < order-1 ({}) on two-back structure",
+            blend,
+            o1
+        );
+    }
+
+    #[test]
+    fn blend_transitions_from_order1_to_order2_after_evidence() {
+        // First only literals stream with NO long-range structure, then switch
+        // to a two-back pattern; blend must stay correct (roundtrip) across
+        // the transition, not just on uniform data.
+        let n = 100;
+        let mut tok: Vec<u16> = Vec::new();
+        for i in 0..2000 {
+            tok.push((i % 3) as u16);
+        }
+        for i in 0..20_000u32 {
+            let row = (i % 4) as u16;
+            tok.push(row);
+            tok.push(50u16);
+            tok.push(if row % 2 == 0 { 7 } else { 8 });
+        }
+        blend_roundtrip(&tok, n);
+    }
+
+    #[test]
+    fn blend_no_worse_than_order1_on_skewed_data() {
+        // Dominant single token: order-1 already near-optimal; blend must not
+        // regress materially (the added order-2 model must not dominate).
+        let n = 100;
+        let mut tok: Vec<u16> = vec![42u16; 10_000];
+        tok.push(3);
+        let o1 = encode_tokens_order1(&tok, n).len();
+        let blend = encode_tokens_blend(&tok, n).len();
+        assert!(
+            blend <= o1 + 4,
+            "blend ({}) regressed past order-1 ({}) + 4",
+            blend,
+            o1
+        );
     }
 }
