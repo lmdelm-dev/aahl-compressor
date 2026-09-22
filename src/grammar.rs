@@ -1,6 +1,6 @@
-//! Persistent cross-block grammar.
+﻿//! Persistent cross-block grammar.
 //!
-//! The core problem this module attacks: `aahl::compress_block` is stateless —
+//! The core problem this module attacks: `aahl::compress_block` is stateless â€”
 //! each 64 KiB chunk is folded and coded in isolation, so a phrase defined in
 //! chunk 1 is reinvented again in chunk 2. zip/7z win on code because their LZ
 //! windows see whole-file matches; our grammar resets every chunk.
@@ -28,7 +28,7 @@
 //!     indices, ascending) and applies the remap locally; the container
 //!     writes the record between DATA records and the decoder applies the
 //!     same remap before the next chunk. Dead grammar history is thereby
-//!     reclaimed in place — alphabet, token costs and memory shrink together.
+//!     reclaimed in place â€” alphabet, token costs and memory shrink together.
 
 use std::collections::HashMap;
 
@@ -62,7 +62,7 @@ const G_TAG: (u8, u8) = (0xA0, b'G');
 /// the persistent grammar by dropping rule-history dead since the last GC
 /// interval and renumbering the survivors 0..k'-1, so the model alphabet
 /// (and every token cost under it) shrinks. The survivors are transmitted
-/// explicitly — the decoder applies exactly the remap the encoder did.
+/// explicitly â€” the decoder applies exactly the remap the encoder did.
 const GC_KIND: u8 = 0x02;
 const GC_BODY_HDR: usize = 1 + 4;
 const DEFAULT_GC_INTERVAL: usize = 64;
@@ -195,11 +195,29 @@ impl PersistentGrammar {
 
     /// Instantiate with a custom GC interval (chunks between GC attempts).
     pub fn with_gc(cfg: FoldConfig, gc_interval: usize) -> Self {
+        Self::with_gc_mode(cfg, gc_interval, crate::arith::ModelMode::V3)
+    }
+
+    /// v4 flavor: exact order-1 contexts for the hottest rule ids. New
+    /// archives (container version 4) use this; v3 archives keep the legacy
+    /// bucketed model so old blobs decode byte-identically.
+    pub fn new_v4(cfg: FoldConfig, gc_interval: usize) -> Self {
+        Self::with_gc_mode(cfg, gc_interval, crate::arith::ModelMode::V4)
+    }
+
+    /// v4 flavor with a snapshot lag (encoder-side look-back; see with_lag).
+    pub fn with_lag_v4(cfg: FoldConfig, gc_interval: usize, lag: usize) -> Self {
+        let mut g = Self::with_gc_mode(cfg, gc_interval, crate::arith::ModelMode::V4);
+        g.lag = lag.max(1);
+        g
+    }
+
+    fn with_gc_mode(cfg: FoldConfig, gc_interval: usize, mode: crate::arith::ModelMode) -> Self {
         Self {
             rules: Vec::new(),
             pair_index: HashMap::new(),
             trie: PhraseTrie::new(),
-            model: PersistentTokenModel::new(256),
+            model: PersistentTokenModel::with_mode(256, mode),
             cfg,
             rules_before: 0,
             staged_pairs: Vec::new(),
@@ -1058,7 +1076,7 @@ mod tests {
             let out = dec.decompress(&blk, raw.len()).expect("decode");
             assert_eq!(out, *raw, "chunk mismatch");
             // GC records are decoded AFTER the chunk that produced them and
-            // BEFORE the next one — exactly the encoder boundary.
+            // BEFORE the next one â€” exactly the encoder boundary.
             if let Some(gc) = gc {
                 let survivors = parse_gc_body(&gc[5..]).expect("parse gc");
                 dec.apply_gc(&survivors).expect("apply gc");
@@ -1334,5 +1352,47 @@ mod tests {
         // the emitter stream refers to an existing live rule (already proved
         // by the successful decode above, which re-folds from the live table).
         assert!(enc.rules_len() >= snap);
+    }
+}
+#[cfg(test)]
+mod tests_v4_grammar {
+    use super::*;
+
+    fn v4_roundtrip_chunks(enc: &mut PersistentGrammar, dec: &mut PersistentGrammar, chunks: &[&[u8]]) {
+        for raw in chunks {
+            let (blk, gc) = enc.compress(raw);
+            let out = dec.decompress(&blk, raw.len()).expect("v4 decode");
+            assert_eq!(out, *raw, "chunk mismatch");
+            if let Some(gc) = gc {
+                let survivors = PersistentGrammar::parse_gc_body(&gc[5..]).expect("parse gc");
+                dec.apply_gc(&survivors).expect("apply gc");
+            }
+            assert_eq!(enc.rules_len(), dec.rules_len(), "grammars drifted");
+            assert_eq!(enc.model.n(), dec.model.n(), "models drifted");
+        }
+    }
+
+    #[test]
+    fn v4_new_v4_mints_exact_context_model_and_roundtrips_with_gc() {
+        let mut enc = PersistentGrammar::new_v4(FoldConfig::default(), 8);
+        let mut dec = PersistentGrammar::new_v4(FoldConfig::default(), 8);
+        assert_eq!(
+            enc.model.n_contexts(),
+            crate::arith::V4_NC,
+            "v4 grammar must use the exact-context model budget"
+        );
+        let phrase = b"the quick brown fox jumps over the lazy dog and runs far away; the quick brown fox says hello. ";
+        let mut chunks: Vec<Vec<u8>> = Vec::new();
+        for i in 0..20u32 {
+            let mut c = Vec::with_capacity(phrase.len() * 30 + 8);
+            for k in 0..30u32 {
+                c.extend_from_slice(phrase);
+                c.push(b'A' + ((k + i) % 26) as u8);
+                c.push(b' ');
+            }
+            chunks.push(c);
+        }
+        let refs: Vec<&[u8]> = chunks.iter().map(|c| c.as_slice()).collect();
+        v4_roundtrip_chunks(&mut enc, &mut dec, &refs);
     }
 }

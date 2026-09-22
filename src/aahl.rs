@@ -1,4 +1,4 @@
-//! AAHL-Fold v1: recursive pair-folding grammar + hand-rolled canonical Huffman.
+﻿//! AAHL-Fold v1: recursive pair-folding grammar + hand-rolled canonical Huffman.
 //! Not LZ77/Huffman-per-block like zip, not PPM like rar.
 //! Pipeline: bytes -> global BPE-style grammar fold -> custom Huffman bitstream.
 //! All code here is from scratch (no zstd/lzma crates).
@@ -11,7 +11,7 @@ use crate::binning;
 use crate::spectral;
 
 const MAX_SYMS: usize = 4096;
-const MAX_MERGES: usize = 512;
+const MAX_MERGES: usize = 1024;
 const MIN_PAIR_COUNT: usize = 4;
 
 /// Tunable fold knobs (used to sweep grammar sizes without recompiling).
@@ -1342,5 +1342,58 @@ mod tests {
         assert_eq!(m, ModeSizes::default());
         let t = mode_sizes(b"a");
         assert!(t.order1_byte > 0);
+    }
+}
+
+#[cfg(test)]
+mod tests_v4_fold {
+    use super::*;
+
+    #[test]
+    fn default_fold_budget_is_1024_merges() {
+        assert_eq!(FoldConfig::default().max_merges, 1024);
+    }
+
+    #[test]
+    fn deeper_default_fold_reduces_token_count() {
+        // Wide-but-repeating vocabulary: every line is a distinct 24-word
+        // sequence over 16 words, so folding needs MANY merges (one distinct
+        // phrase per bigram type) and a larger merge budget must strictly
+        // reduce the token count that survives.
+        let vocab: Vec<&str> = vec![
+            "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
+            "india", "juliet", "kilo", "lima", "mike", "november", "oscar", "papa",
+        ];
+        let mut raw: Vec<u8> = Vec::new();
+        let mut state: u64 = 0x9E3779B97F4A7C15;
+        for line in 0..4000 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let mut seed = state ^ (line as u64 * 0x9E3779B9);
+            for _ in 0..24 {
+                seed = seed.wrapping_mul(2862933555777941757).wrapping_add(3037000493);
+                raw.extend_from_slice(vocab[(seed >> 33) as usize % vocab.len()].as_bytes());
+                raw.push(b' ');
+            }
+            raw.push(b'\n');
+        }
+        let syms: Vec<u16> = raw.iter().map(|&b| b as u16).collect();
+        let deep = fold_with(syms.clone(), &FoldConfig::default());
+        let shallow_cfg = FoldConfig {
+            max_merges: 256,
+            min_pair_count: MIN_PAIR_COUNT,
+            max_syms: MAX_SYMS,
+        };
+        let shallow = fold_with(syms, &shallow_cfg);
+        assert!(
+            deep.0.len() < shallow.0.len(),
+            "deeper merge budget must reduce tokens ({} vs {})",
+            deep.0.len(),
+            shallow.0.len()
+        );
+        assert_eq!(
+            crate::aahl::unfold(&deep.0, &deep.1, raw.len()).unwrap(),
+            raw,
+            "deeper fold must stay lossless"
+        );
     }
 }

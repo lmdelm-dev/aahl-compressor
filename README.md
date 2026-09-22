@@ -1,4 +1,4 @@
-# AAHL - grammar-folding archive
+﻿# AAHL - grammar-folding archive
 
 AAHL is a from-scratch lossless compressor (no LZ77/Huffman-per-block like zip,
 no PPM like rar, no zstd/lzma crates). It compresses by building a persistent
@@ -24,7 +24,9 @@ bytes -> chunk -> fold (recursive pair merging) -> symbols
   silent wrong file.
 - **Verbatim-faithful**: `-j1` and any `-jN` are byte-identical; the decoder is
   a pure function of archive bytes (snapshot lag is an encoder-only concept).
-- **No worse than raw**: an archive is never larger than the input. Chunks that
+- **v4 token model**: exact order-1 contexts for the 192 hottest grammar rules
+  (format constants in docs/SPEC.md) plus deterministic cold hashing; v3
+  archives stay readable, and older readers reject v4 containers cleanly.- **No worse than raw**: an archive is never larger than the input. Chunks that
   resist all codecs fall back to STORE; whole incompressible inputs use the
   STORE container.
 
@@ -45,7 +47,7 @@ aahl bench  <SET_DIR> [--tsv bench_results.tsv]
 aahl blocksize <INPUT> [--sweep]
 ```
 
-- `create` defaults to 64 KiB chunks (`--chunk-size`), grammar snapshot lag 16
+- `create` defaults to 1 MiB chunks (`--chunk-size`), grammar snapshot lag 16
   (`--lag`), GC every 64 chunks (`--gc-interval`), serial discovery
   (`--jobs 1`). Duplicate chunks are deduplicated; identical files share refs.
 - `extract` recreates the recorded relative paths under `OUT_DIR`. Paths are
@@ -65,7 +67,7 @@ Two containers share the footer:
 - **Compressed** (`AAHL` v3): header + params + recorded stream of DATA chunks
   and interleaved grammar-GC records, then the file table.
 - **STORE** (`AS` v2): raw concatenated payload with a per-file blake3 in the
-  table — used when the input is incompressible.
+  table â€” used when the input is incompressible.
 
 See `docs/SPEC.md` for the byte-level layout and `docs/DESIGN.md` for the
 grammar, GC, lag, and parallelism rationale.

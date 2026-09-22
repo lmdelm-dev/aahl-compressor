@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+﻿use anyhow::{bail, Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -42,7 +42,7 @@ fn file_hash_map(dir: &Path) -> Result<Vec<(String, u64, [u8; 32])>> {
     Ok(out)
 }
 
-fn run_aahl(corpus_dir: &Path, root: &Path, exe: &Path) -> Result<Row> {
+fn run_aahl(corpus_dir: &Path, root: &Path, exe: &Path, chunk_size: usize) -> Result<Row> {
     let name = corpus_dir
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
@@ -54,6 +54,10 @@ fn run_aahl(corpus_dir: &Path, root: &Path, exe: &Path) -> Result<Row> {
     let arc = work.join("aahl.aahl");
     let (create_ms, _) = timed(|| {
         let mut args = vec!["create".to_string(), arc.to_string_lossy().into_owned()];
+        if chunk_size != 1_048_576 {
+            args.push("--chunk-size".to_string());
+            args.push(chunk_size.to_string());
+        }
         for (_, p) in &files {
             args.push(p.to_string_lossy().into_owned());
         }
@@ -240,7 +244,7 @@ pub fn find_tool(name: &str) -> Option<PathBuf> {
     corpus::which(name)
 }
 
-pub fn run_bench(set_dir: &Path, out_tsv: &Path) -> Result<Vec<Row>> {
+pub fn run_bench(set_dir: &Path, out_tsv: &Path, chunk_size: usize) -> Result<Vec<Row>> {
     let exe = std::env::current_exe().context("current_exe")?;
     atmosphere(&exe)?;
     let root = set_dir.parent().unwrap_or(set_dir).to_path_buf();
@@ -249,7 +253,7 @@ pub fn run_bench(set_dir: &Path, out_tsv: &Path) -> Result<Vec<Row>> {
     for d in dirs {
         let name = d.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
         eprintln!("== corpus: {name}");
-        if let Ok(r) = run_aahl(&d, &root, &exe) {
+        if let Ok(r) = run_aahl(&d, &root, &exe, chunk_size) {
             rows.push(r);
         } else {
             eprintln!("  aahl: skipped (error)");

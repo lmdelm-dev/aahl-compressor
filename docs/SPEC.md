@@ -1,6 +1,6 @@
-# AAHL container format spec
+﻿# AAHL container format spec
 
-This document is normative for the v3 format and the v2 STORE container.
+This document is normative for the v4 format and the v2 STORE container.
 Offsets are little-endian. All sizes are in bytes.
 
 ## 1. Top level
@@ -39,16 +39,16 @@ never larger than its inputs** (modulo the honest tables above).
 ```
 offset  field                size  value
 0       magic                4     "AAHL"
-4       version              2     = 3
+4       version              2     = 4
 6       flags                2     FLAG_FOLD (0x0001) | FLAG_GLOBAL (0x0002)
-8       chunk_size           4     u32 bytes per chunk (CLI default 65536)
-12      params               8     u64 packed params (see §2.1)
+8       chunk_size           4     u32 bytes per chunk (CLI default 1048576)
+12      params               8     u64 packed params (see Â§2.1)
 20      header_checksum      2     u16 = first 2 bytes of blake3(prefix[0..20])
-22      ...DATA records...   var   tagged stream (see §3), each optionally
+22      ...DATA records...   var   tagged stream (see Â§3), each optionally
                                   followed by grammar-GC records
 table_offset
         num_files            8     u64
-        file table           var   (§4)
+        file table           var   (Â§4)
 EOF-36  "AAHE"               4
 EOF-32  table_offset         8     u64
 EOF-24  table_len            8     u64
@@ -70,9 +70,43 @@ any allocation is driven by `chunk_size`/`params`).
 | 32..56  | max_rules    | 0xFF_FFFF   | 60000   |
 | 56..64  | flags2       | 0xFF        | 0       |
 
-`lag` is encoder-only (§DESIGN); the decoder never needs it. `max_rules` is a
+`lag` is encoder-only (Â§DESIGN); the decoder never needs it. `max_rules` is a
 decoder safety cap (defensive bound on model growth). Both `lag` and
-`gc_interval` are sanity-checked against the negative sizes they would allow.
+`gc_interval` are sanity-checked against the negative sizes they would allow.sanity-checked against the negative sizes they would allow.
+
+### 2.2 Persistent token model contexts (normative for v4)
+
+'G' blocks entropy-code grammar tokens against the archive-wide persistent
+model. In v4 the model allocates exactly `256 + HOT_RULES + RULE_CTX + 1 == 457`
+contexts (HOT_RULES = 192, RULE_CTX = 8, both format constants):
+
+| context range                        | symbols         | purpose                              |
+|--------------------------------------|-----------------|--------------------------------------|
+| 0 .. 256                             | literal bytes   | order-1 over raw/literal symbols     |
+| 256 .. 256+HOT_RULES                 | rule ids        | exact per-rule context (hot window)  |
+| 256+HOT_RULES .. 256+HOT_RULES+RULE_CTX | rule ids     | cold rules hashed into RULE_CTX buckets |
+| 256+HOT_RULES+RULE_CTX (sentinel)    | chunk boundary  | reseeding at chunk starts            |
+
+The context of a token is a pure function of (`symbol`, `mode`); it never
+depends on the alphabet size `n`, so the encoder and decoder derive identical
+contexts from the same rule table even after grow/shrink and GC renumbering.
+For a rule id `s >= 256`: hot rows cover `s - 256 < HOT_RULES` exactly; cold
+rows use `cold_ctx(s) = 256 + HOT_RULES + (((s - 256 - HOT_RULES) * 0x9E37_79B9) as usize) % RULE_CTX`.
+The model grows/shrinks by repeating *last* contexts (t_mix-style) so rolling
+alphabet changes are deterministic. Changing HOT_RULES or RULE_CTX is a format
+break; archives must be created and extracted with the same constants.
+
+### 2.3 Version history
+
+| version | meaning                                        |
+|---------|------------------------------------------------|
+| 1..=3   | legacy compressed containers (RULE_CTX=8 only) |
+| 4       | current: adds the exact hot-rule contexts above |
+| >= 5    | rejected by this reader                        |
+
+v4 readers open v1..=v4 and reject anything newer (the guard is exercised by
+`container_tests::future_container_versions_are_rejected`). v3 archives remain
+byte-compatible: a v4 reader extracts them with the legacy 8-bucket model.
 
 ## 3. Record stream
 
@@ -101,23 +135,23 @@ Reader structural bounds:
 Within a DATA body, the packed block is produced by `grammar::PersistentGrammar`
 or the stateless `aahl::compress_block` fallback. Two families exist:
 
-**Persistent grammar ('G' blocks)** — layout:
+**Persistent grammar ('G' blocks)** â€” layout:
 
 ```
 [0xA0, b'G'] num_new_rules u32 (l u16, r u16)* num_tokens u32 blob_len u32 blob
 ```
 
 Each G block appends rules to the archive's single persistent grammar and
-entropy-codes tokens against the persistent model. Rules referenced are always
+entropy-codes tokens against the persistent model (v4 context layout in 2.2). Rules referenced are always
 defined in the same block (forward references are impossible), so the decoder
 reconstructs exactly the encoder's table.
 
 **Stateless (`aahl::compress_block`, tag byte at index 0):**
 
 - `[0xA0, b'F']` recursive pair-folding + canonical Huffman (fold lexicographic).
-- `[0xA0, b'S']` spectral blocks — FFT period detection; stores one exact period
+- `[0xA0, b'S']` spectral blocks â€” FFT period detection; stores one exact period
   (verified in time domain) instead of a grammar.
-- `[0xA0, b'B']` binning — structurally similar pieces grouped into bins so
+- `[0xA0, b'B']` binning â€” structurally similar pieces grouped into bins so
   each bin's grammar sees clean repetition.
 - `[0xA0, b'A']` adaptive order-0 arithmetic after fold.
 - `[0xA0, b'D']` order-1 over folded grammar tokens.
@@ -138,7 +172,7 @@ per entry:
 `refs` index into the unique-chunk stream (0-based, first-seen order).
 Duplicate chunks and duplicate files are deduplicated at create time; identical
 files share refs. `file_len` may exceed the sum of chunk lengths is not a thing
-— extraction writes `min(ref.len, remaining)` per ref in order, so the total
+â€” extraction writes `min(ref.len, remaining)` per ref in order, so the total
 reassembles the original byte sequence.
 
 ## 5. STORE container (`AS`, version 2)
@@ -158,7 +192,7 @@ EOF-16  num_chunks     8     u64 (always 0 for STORE)
 EOF-8   num_files      8     u64
 ```
 
-STORE mode is fully alternative — there are no chunk records, so extraction
+STORE mode is fully alternative â€” there are no chunk records, so extraction
 reads a file's `file_len` bytes straight from the payload and verifies the
 blake3 hash. Reader structural bound: `num_files <= (file_len - table_offset)/42`
 (2 + path + 8 + 32 per entry minimum) protects the table walk.
@@ -166,7 +200,7 @@ blake3 hash. Reader structural bound: `num_files <= (file_len - table_offset)/42
 ### 5.1 Why version 2 (STORE v1 -> v2 break)
 
 STORE v1 stored no payload checksums. A corrupted `path_len` would shift the
-payload read for every later file **silently** — sizes and names looked right,
+payload read for every later file **silently** â€” sizes and names looked right,
 bytes were wrong. v2 writes a per-file blake3 in the table and verifies each
 payload on extract; any mismatch is an error, never a wrong file.
 

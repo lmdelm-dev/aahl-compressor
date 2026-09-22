@@ -1,4 +1,4 @@
-//! From-scratch carryless range coder (LZMA-style) + adaptive order-0 model.
+﻿//! From-scratch carryless range coder (LZMA-style) + adaptive order-0 model.
 //! Encodes a folded-token stream with per-symbol adaptive counts tracked
 //! through a Fenwick tree, so probabilities converge to the true distribution
 //! without storing a model table in the block.
@@ -320,6 +320,53 @@ pub fn token_ctx(sym: usize, n: usize) -> usize {
     if sym < 256 { sym } else { rule_ctx(sym, n) }
 }
 
+// ---------- Persistent model flavors (v3 vs v4) ----------
+//
+// V3 (legacy) hashes every rule symbol into RULE_CTX buckets. V4 gives the
+// hottest rule ids (symbols 0..HOT_RULES above the literal range) an exact
+// order-1 context row each and buckets only the cold tail. The mapping is a
+// pure function of the symbol (never of the alphabet size), so encoder and
+// decoder converge byte-identically in both flavors.
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ModelMode {
+    V3,
+    V4,
+}
+
+/// Rules (symbols 256..256+HOT_RULES) that get exact context rows in V4.
+pub const HOT_RULES: usize = 192;
+
+/// V4 context budget: literals + hot-rule rows + cold rule buckets + sentinel.
+pub const V4_NC: usize = 256 + HOT_RULES + RULE_CTX + 1;
+
+fn hot_ctx(sym: usize) -> usize {
+    256 + (sym - 256)
+}
+
+fn cold_ctx(sym: usize) -> usize {
+    // mirrors rule_ctx's multiplier so the cold tail keeps the same cyclic
+    // permutation over the RULE_CTX buckets, offset past the hot rows
+    256 + HOT_RULES + (((sym - 256 - HOT_RULES) * 0x9E37_79B9) as usize) % RULE_CTX
+}
+
+pub fn v4_ctx(sym: usize, n: usize) -> usize {
+    if sym < 256 {
+        sym
+    } else if sym < 256 + HOT_RULES {
+        hot_ctx(sym)
+    } else {
+        cold_ctx(sym)
+    }
+}
+
+fn nc_for(mode: ModelMode) -> usize {
+    match mode {
+        ModelMode::V3 => TOKEN_NC,
+        ModelMode::V4 => V4_NC,
+    }
+}
+
 pub fn encode_tokens_order1(tokens: &[u16], n: usize) -> Vec<u8> {
     let nc = TOKEN_NC;
     let mut enc = Encoder::new();
@@ -402,12 +449,20 @@ pub struct PersistentTokenModel {
     // transaction log for rejecting a candidate chunk atomically
     log: Vec<(usize, usize, u64)>,
     start_ctx: usize,
+    mode: ModelMode,
 }
 
 impl PersistentTokenModel {
+    /// Classic (v3) persistent model: rules rotate through RULE_CTX buckets.
     pub fn new(n0: usize) -> Self {
+        Self::with_mode(n0, ModelMode::V3)
+    }
+
+    /// Persistent model in an explicit flavor: V3 = hashed rule buckets,
+    /// V4 = exact contexts for the hottest rules plus buckets for the tail.
+    pub fn with_mode(n0: usize, mode: ModelMode) -> Self {
         assert!((256..=MAX_SYMS).contains(&n0));
-        let nc = TOKEN_NC;
+        let nc = nc_for(mode);
         // Fenwicks are allocated at full MAX_SYMS capacity so `grow` can later
         // add columns without reallocating index bounds; only [0, n0) holds 1s.
         let counts = vec![vec![1u64; n0]; nc];
@@ -418,7 +473,30 @@ impl PersistentTokenModel {
             }
         }
         let total = vec![n0 as u64; nc];
-        Self { n: n0, base_n: n0, counts, fw, total, ctx: TOKEN_SENTINEL, log: Vec::new(), start_ctx: TOKEN_SENTINEL }
+        Self {
+            n: n0,
+            base_n: n0,
+            counts,
+            fw,
+            total,
+            ctx: nc - 1,
+            log: Vec::new(),
+            start_ctx: nc - 1,
+            mode,
+        }
+    }
+
+    /// Map a symbol (0..n) to its order-1 context row in this model's flavor.
+    fn ctx_of(&self, s: usize, n: usize) -> usize {
+        match self.mode {
+            ModelMode::V3 => token_ctx(s, n),
+            ModelMode::V4 => v4_ctx(s, n),
+        }
+    }
+
+    /// Context row used for the first token of a chunk (nothing seen yet).
+    fn sentinel(&self) -> usize {
+        self.counts.len() - 1
     }
 
     /// Number of adaptive contexts in the persistent model (literals + rule
@@ -454,7 +532,7 @@ impl PersistentTokenModel {
     /// GC shrink: drop the dead grammar history by truncating the alphabet to
     /// `n2` (>= 256). Literal symbols (< 256) keep their accumulated counts
     /// everywhere; surviving rule symbols are *re-added* with the count-1 prior
-    /// (frequency history is forgotten, the rule definitions are not — they
+    /// (frequency history is forgotten, the rule definitions are not â€” they
     /// live in grammar.rs). Every tree is rebuilt exactly from the counts rows
     /// so the encoder and decoder converge byte-identically: both sides run
     /// shrink_alphabet with the same n2 at the same chunk boundary.
@@ -489,8 +567,9 @@ impl PersistentTokenModel {
     /// Start of a new chunk: reset the context to the sentinel (first-token)
     /// and begin a fresh transaction log for this chunk's tokens.
     pub fn begin_chunk(&mut self) {
-        self.start_ctx = TOKEN_SENTINEL;
-        self.ctx = TOKEN_SENTINEL;
+        let s = self.sentinel();
+        self.start_ctx = s;
+        self.ctx = s;
         self.base_n = self.n;
         self.log.clear();
     }
@@ -533,7 +612,7 @@ impl PersistentTokenModel {
         self.counts[c][s] += 1;
         self.fw[c].add(s, 1);
         self.total[c] += 1;
-        self.ctx = token_ctx(s, self.n);
+        self.ctx = self.ctx_of(s, self.n);
     }
 
     /// Decode one token using this archive-wide model.
@@ -554,7 +633,7 @@ impl PersistentTokenModel {
         self.counts[c][s] += 1;
         self.fw[c].add(s, 1);
         self.total[c] += 1;
-        self.ctx = token_ctx(s, self.n);
+        self.ctx = self.ctx_of(s as usize, self.n);
         Ok(s as u16)
     }
 }
@@ -1122,5 +1201,176 @@ mod tests {
             blend,
             o1
         );
+    }
+}
+
+#[cfg(test)]
+mod tests_v4_model {
+    use super::*;
+
+    fn encode_tokens_model(tokens: &[u16], n: usize, mode: ModelMode) -> Vec<u8> {
+        let mut m = PersistentTokenModel::with_mode(n, mode);
+        m.begin_chunk();
+        let mut enc = Encoder::new();
+        for &t in tokens {
+            m.encode_token(t as usize, &mut enc);
+        }
+        enc.flush()
+    }
+
+    fn v4_roundtrip(tokens: &[u16], n: usize) {
+        let mut out = Vec::new();
+        let mut m = PersistentTokenModel::with_mode(n, ModelMode::V4);
+        m.begin_chunk();
+        let buf = encode_tokens_model(tokens, n, ModelMode::V4);
+        let mut dec = Decoder::new(&buf);
+        m.begin_chunk();
+        for _ in 0..tokens.len() {
+            m.decode_token(&mut dec).expect("v4 decode");
+        }
+        // decode consumed symbols must match via a fresh walk:
+        let mut out2 = Vec::new();
+        let mut m2 = PersistentTokenModel::with_mode(n, ModelMode::V4);
+        m2.begin_chunk();
+        let mut dec2 = Decoder::new(&buf);
+        for _ in 0..tokens.len() {
+            out2.push(m2.decode_token(&mut dec2).expect("v4 decode"));
+        }
+        assert_eq!(out2, tokens);
+        out.extend_from_slice(&buf);
+    }
+
+    #[test]
+    fn v4_context_budget_consts() {
+        assert_eq!(TOKEN_NC, 265, "v3 budget must stay frozen");
+        assert_eq!(V4_NC, 256 + HOT_RULES + RULE_CTX + 1);
+        assert_eq!(V4_NC, 457);
+        assert!(HOT_RULES >= RULE_CTX);
+    }
+
+    #[test]
+    fn v4_context_mapping_bounds_and_exactness() {
+        // hot rules get exact rows; literals are their own context
+        for s in 256..(256 + HOT_RULES) {
+            let c = v4_ctx(s, MAX_SYMS);
+            assert_eq!(c, 256 + (s - 256), "hot rule {s} mapped to {c}");
+        }
+        for s in 0..256 {
+            assert_eq!(v4_ctx(s, MAX_SYMS), s);
+        }
+        // cold rules stay inside the bucket tail, never colliding with hot rows
+        for s in (256 + HOT_RULES)..2560 {
+            let c = v4_ctx(s, MAX_SYMS);
+            assert!(
+                c >= 256 + HOT_RULES && c < 256 + HOT_RULES + RULE_CTX,
+                "cold rule {s} ctx {c} outside bucket tail"
+            );
+        }
+        // context depends only on the symbol, not the alphabet size
+        assert_eq!(v4_ctx(300, 301), v4_ctx(300, MAX_SYMS));
+        // the sentinel context is not reachable from any symbol
+        assert_eq!(v4_ctx(MAX_SYMS - 1, MAX_SYMS).max(0) < V4_NC - 1, true);
+    }
+
+    #[test]
+    fn v4_cold_rules_permute_all_buckets() {
+        let mut seen = std::collections::HashSet::new();
+        for s in (256 + HOT_RULES)..(256 + HOT_RULES + RULE_CTX) {
+            seen.insert(v4_ctx(s, MAX_SYMS));
+        }
+        assert_eq!(seen.len(), RULE_CTX, "cold rules must use all {RULE_CTX} buckets");
+    }
+
+    #[test]
+    fn v4_roundtrips_and_is_byte_deterministic() {
+        v4_roundtrip(&[], 256);
+        v4_roundtrip(&[0u16, 1, 2, 255], 256);
+        let mut tok: Vec<u16> = Vec::new();
+        for i in 0..3000u32 {
+            tok.push(((i * 7) % 330) as u16);
+        }
+        v4_roundtrip(&tok, 330);
+        let a = encode_tokens_model(&tok, 330, ModelMode::V4);
+        let b = encode_tokens_model(&tok, 330, ModelMode::V4);
+        assert_eq!(a, b, "v4 encode must be byte-deterministic");
+    }
+
+    #[test]
+    fn v4_grow_shrink_rollback_are_consistent() {
+        let mut m = PersistentTokenModel::with_mode(256, ModelMode::V4);
+        m.begin_chunk();
+        let mut enc = Encoder::new();
+        m.grow(1000);
+        for &t in &[260u16, 5u16, 261u16, 7u16, 999u16] {
+            m.encode_token(t as usize, &mut enc);
+        }
+        let blob1 = enc.flush();
+        m.rollback_chunk();
+        // after rollback the model is pristine: same encode must give same bytes
+        let mut m2 = PersistentTokenModel::with_mode(256, ModelMode::V4);
+        m2.begin_chunk();
+        m2.grow(1000);
+        let mut enc2 = Encoder::new();
+        for &t in &[260u16, 5u16, 261u16, 7u16, 999u16] {
+            m2.encode_token(t as usize, &mut enc2);
+        }
+        assert_eq!(enc2.flush(), blob1, "rollback must restore exact model state");
+        // GC shrink truncates and rebuilds identically on both sides
+        let mut e = PersistentTokenModel::with_mode(300, ModelMode::V4);
+        e.grow(330);
+        e.shrink_alphabet(256);
+        let mut d = PersistentTokenModel::with_mode(256, ModelMode::V4);
+        let mut enc3 = Encoder::new();
+        e.begin_chunk();
+        for &t in &[5u16, 9u16, 250u16] {
+            e.encode_token(t as usize, &mut enc3);
+        }
+        let buf = enc3.flush();
+        d.begin_chunk();
+        let mut dec = Decoder::new(&buf);
+        let mut got = Vec::new();
+        for _ in 0..3 {
+            got.push(d.decode_token(&mut dec).expect("decode"));
+        }
+        assert_eq!(got, vec![5u16, 9u16, 250u16]);
+    }
+
+    #[test]
+    fn v4_beats_v3_when_followers_differ_across_rules() {
+        // rule ids 256..300 (all HOT). Under v3 the 44 rules collapse into 8
+        // shared bucket rows (idx % 8), so a bucket mixes ~6 distinct follower
+        // literals (r % 256). v4 gives each rule an exact row, so after warmup
+        // the follower is predicted near-deterministically.
+        let n = 300;
+        let mut tok: Vec<u16> = Vec::new();
+        for i in 0..30_000u32 {
+            let r = 256 + ((i % 44) as u16);
+            tok.push(r);
+            tok.push((r % 256) as u16);
+        }
+        let v3 = encode_tokens_model(&tok, n, ModelMode::V3);
+        let v4 = encode_tokens_model(&tok, n, ModelMode::V4);
+        assert!(
+            v4 < v3,
+            "expected v4 ({}) < v3 ({}) when exact rule contexts disambiguate followers", v4.len(), v3.len()
+        );
+        // v4 must decode the same stream losslessly
+        let mut out = Vec::new();
+        let mut m = PersistentTokenModel::with_mode(n, ModelMode::V4);
+        m.begin_chunk();
+        let mut dec = Decoder::new(&v4);
+        for _ in 0..tok.len() {
+            out.push(m.decode_token(&mut dec).expect("v4 decode"));
+        }
+        assert_eq!(out, tok);
+    }
+
+    #[test]
+    fn v4_context_count_is_bounded_for_footprint() {
+        // 457 contexts x 4096 symbols x 8 bytes x 2 (counts + Fenwick) fits the
+        // ablation footprint budget (~30 MiB).
+        let m = PersistentTokenModel::with_mode(MAX_SYMS, ModelMode::V4);
+        assert_eq!(m.n_contexts(), V4_NC);
+        assert!(m.n_contexts() * MAX_SYMS * 8 * 2 < 64 * 1024 * 1024);
     }
 }

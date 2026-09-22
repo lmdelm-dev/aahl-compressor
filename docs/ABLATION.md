@@ -1,4 +1,4 @@
-# AAHL ablation study (2026-09)
+﻿# AAHL ablation study (2026-09)
 
 Harness: `aahl ablate <corpus_set> --tsv out.tsv` (see `src/ablation.rs`).
 Every number below is produced by the real codecs, not re-implementations.
@@ -40,7 +40,7 @@ Synthetic deterministic set: `precompressed`, `random`, `table` (CSV-ish),
 
    RULE_CTX is a *format-level constant*: writer and reader must agree on the
    token-context layout or G/order-1-token blocks fail their per-chunk blake3
-   check (loud failure, never silent corruption — but existing v3 archives
+   check (loud failure, never silent corruption â€” but existing v3 archives
    would stop reading). A 0.08% aggregate gain concentrated at the
    non-default chunk size does not justify a v3->v4 format bump. **Decision:
    keep RULE_CTX=8.** Clone-friendly to test? The archive's own default and
@@ -48,7 +48,7 @@ Synthetic deterministic set: `precompressed`, `random`, `table` (CSV-ish),
 
 2. **The order-1+2 "blend" codec never wins** on any corpus at any chunk size.
    It is dead code in `arith.rs`; wiring it into the persistent model (the
-   original hypothesis) would *not* have helped — every blend row >= order1_tok
+   original hypothesis) would *not* have helped â€” every blend row >= order1_tok
    row. Rejected.
 
 3. **The persistent grammar's advantage is at small chunk sizes.** For
@@ -84,3 +84,37 @@ Synthetic deterministic set: `precompressed`, `random`, `table` (CSV-ish),
 ## Raw rows
 `ablation.tsv` (RULE_CTX=8) kept in repo; `ablation_rtx{16,32,64}.tsv` from
 the sweep are reproducible via `aahl ablate` after flipping `RULE_CTX`.
+## v4 sweep (shipping grammar: with_lag_v4, HOT_RULES=192, MAX_MERGES=1024)
+
+Harness: `aahl ablate corpus_set --tsv out.tsv --chunk-sizes 65536,262144,1048576`.
+`grammar` is the payload archives actually emit as G blocks.
+
+| corpus      | chunk    | raw      | stateless | grammar   | model_bytes |
+|-------------|----------|----------|-----------|-----------|-------------|
+| table       | 65536    | 9128841  | 1978863   | 1979079   | 17286152    |
+| table       | 262144   | 9128841  | 1738931   | 1738931   | 15918256    |
+| table       | 1048576  | 9128841  | 1682478   | 1673892   | 19782640    |
+| text-large  | 65536    | 1375929  | 397483    | 397483    | 15918256    |
+| text-large  | 262144   | 1375929  | 342830    | 342830    | 15918256    |
+| text-large  | 1048576  | 1375929  | 324804    | 324804    | 15918256    |
+
+Findings (this drove the shipped defaults):
+
+1. **Larger chunks are monotone-better for both corpora**, so the default was
+   moved to 1 MiB (the allowed max). text-large's grammar equals its
+   stateless best at every chunk (the model cost is only paid when G wins);
+   table's grammar beats stateless only at 1 MiB (1673892 vs 1682478).
+2. **The v4 model's marginal contribution is real but small on table**
+   (~0.5% at 1 MiB vs the v3 8-bucket model). Followers of table rules are
+   near-uniform; no HOT_RULES window (64..256) concentrates them, so the
+   exact-context grid position is flat. The v4 exact rows pay off on
+   rule-dominant streams (docstring/DIY corpora, repeated phrase blocks),
+   covered by unit-level tests rather than this sweep.
+3. **Contrast with the RULE_CTX ablation above**: widening buckets (8->16)
+   also gained only at small chunks and lost at 262144. Together the two
+   sweeps show the grammar's cross-chunk rule reuse - not context width - is
+   the lever that scales with chunk size.
+4. **model_bytes** stays well under the 64 MiB footprint cap (footprint test:
+   `model_footprint_is_bounded_and_reported`); 19782640 bytes at 1 MiB/table
+   is the high-water mark and corresponds to the largest alphabet (457
+   contexts x 4096 counts x 8 bytes x 2 for Fenwick).

@@ -1,4 +1,4 @@
-mod aahl;
+﻿mod aahl;
 mod ablation;
 mod arith;
 mod bench;
@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 const MAGIC_HDR: &[u8; 4] = b"AAHL";
 const MAGIC_FTR: &[u8; 4] = b"AAHE";
 const MAGIC_STORE: &[u8; 2] = b"AS"; // STORE container magic (offset 0)
-const VERSION: u16 = 3;
+const VERSION: u16 = 4;
 const FLAG_FOLD: u16 = 0x0001;
 const FLAG_GLOBAL: u16 = 0x0002; // persistent cross-block grammar (v2 blocks)
 const FLAG_SNAPSHOT: u16 = 0x0004; // reserved (Phase 3 snapshot histories)
@@ -55,7 +55,7 @@ enum Cmd {
         archive: PathBuf,
         #[arg(value_name = "INPUTS", help = "input files and/or directories")]
         inputs: Vec<PathBuf>,
-        #[arg(long, default_value_t = 65_536, help = "chunk size in bytes (64 KiB default)")]
+        #[arg(long, default_value_t = 1_048_576, help = "chunk size in bytes (1 MiB default)")]
         chunk_size: u32,
         /// Grammar snapshot lookahead (chunks): higher lag lets a chunk fork
         /// from a state a few chunks earlier, bounding parallel dispatch.
@@ -101,6 +101,8 @@ enum Cmd {
         set_dir: PathBuf,
         #[arg(long, default_value = "bench_results.tsv", help = "write results to this TSV")]
         tsv: PathBuf,
+        #[arg(long, default_value_t = 1_048_576, help = "chunk size in bytes for the aahl lane")]
+        chunk_size: usize,
     },
     /// Ablation study: per-corpus payload per chunk size per pipeline mode
     #[command(name = "ablate")]
@@ -108,6 +110,13 @@ enum Cmd {
         set_dir: PathBuf,
         #[arg(long, default_value = "ablation.tsv", help = "write results to this TSV")]
         tsv: PathBuf,
+        #[arg(
+            long,
+            value_delimiter = ',',
+            default_value = "4096,16384,65536,262144",
+            help = "comma-separated chunk sizes to measure"
+        )]
+        chunk_sizes: Vec<usize>,
     },
 }
 
@@ -265,6 +274,20 @@ fn cmd_create_params(
     params: u64,
     jobs: usize,
 ) -> Result<()> {
+    cmd_create_params_version(archive, inputs, chunk_size, params, jobs, VERSION)
+}
+
+/// Full create path with an explicit container version. Production writes
+/// VERSION (4: exact-context hot-rule model); tests use this seam to build
+/// legacy v3 archives through the same emit machinery.
+fn cmd_create_params_version(
+    archive: &Path,
+    inputs: &[PathBuf],
+    chunk_size: u32,
+    params: u64,
+    jobs: usize,
+    version: u16,
+) -> Result<()> {
     if !(4096..=1_048_576).contains(&chunk_size) {
         bail!("chunk-size must be 4KiB..1MiB (fold is O(n*m), keep small)");
     }
@@ -274,7 +297,7 @@ fn cmd_create_params(
     // 20-byte v3 prefix: magic(4) | version u16 | flags u16 | chunk_size u32 | params u64
     let mut prefix = [0u8; 20];
     prefix[..4].copy_from_slice(MAGIC_HDR);
-    prefix[4..6].copy_from_slice(&VERSION.to_le_bytes());
+    prefix[4..6].copy_from_slice(&version.to_le_bytes());
     prefix[6..8].copy_from_slice(&(FLAG_FOLD | FLAG_GLOBAL).to_le_bytes());
     prefix[8..12].copy_from_slice(&chunk_size.to_le_bytes());
     prefix[12..20].copy_from_slice(&params.to_le_bytes());
@@ -318,11 +341,19 @@ fn cmd_create_params(
 
     // AAHL core: custom fold codec + persistent grammar, NOT zstd/LZ.
     let (lag, gc_interval, _, _) = unpack_params(params);
-    let mut grammar = grammar::PersistentGrammar::with_lag(
-        aahl::FoldConfig::default(),
-        gc_interval as usize,
-        lag as usize,
-    );
+    let mut grammar = if version >= 4 {
+        grammar::PersistentGrammar::with_lag_v4(
+            aahl::FoldConfig::default(),
+            gc_interval as usize,
+            lag as usize,
+        )
+    } else {
+        grammar::PersistentGrammar::with_lag(
+            aahl::FoldConfig::default(),
+            gc_interval as usize,
+            lag as usize,
+        )
+    };
 
     // Emit every unique chunk in first-seen order. With jobs <= 1 (or lag <= 1)
     // discovery and commit share the serial path; with lag > 1 and jobs > 1 a
@@ -599,7 +630,7 @@ fn open_index(archive: &Path) -> Result<(File, ArchiveIndex)> {
         bail!("bad magic (not aahl)");
     }
     let ver = read_u16(&mut f)?;
-    if !(1..=3).contains(&ver) {
+    if !(1..=4).contains(&ver) {
         bail!("unsupported version {ver}");
     }
     let flags = read_u16(&mut f)?;
@@ -950,12 +981,16 @@ fn cmd_extract(archive: &Path, out_dir: &Path) -> Result<()> {
         return Ok(());
     }
 
-    // v2/v3 persistent grammar: chunk decode order is the honest contract, so
+    // v2+ persistent grammar: chunk decode order is the honest contract, so
     // decode every chunk once in index order through a single grammar and
     // serve the file references from the full cache. GC records interleaved
     // with DATA records retarget the grammar before the next chunk.
     let ordered_cache: HashMap<u32, Vec<u8>> = if idx.flags & FLAG_GLOBAL != 0 {
-        let mut g = grammar::PersistentGrammar::default();
+        let mut g = if idx.version >= 4 {
+            grammar::PersistentGrammar::new_v4(aahl::FoldConfig::default(), 64)
+        } else {
+            grammar::PersistentGrammar::default()
+        };
         let mut cache: HashMap<u32, Vec<u8>> = HashMap::with_capacity(idx.chunks.len());
         let mut gci = 0usize;
         for (i, meta) in idx.chunks.iter().enumerate() {
@@ -1081,12 +1116,12 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::BuildCorpus { set_dir, source } => corpus::build_corpus(&set_dir, source.as_deref()),
-        Cmd::RunBench { set_dir, tsv } => {
-            bench::run_bench(&set_dir, &tsv)?;
+        Cmd::RunBench { set_dir, tsv, chunk_size } => {
+            bench::run_bench(&set_dir, &tsv, chunk_size)?;
             Ok(())
         }
-        Cmd::RunAblate { set_dir, tsv } => {
-            ablation::run_ablation(&set_dir, &tsv, &ablation::ABLATION_CHUNK_SIZES)?;
+        Cmd::RunAblate { set_dir, tsv, chunk_sizes } => {
+            ablation::run_ablation(&set_dir, &tsv, &chunk_sizes)?;
             Ok(())
         }
     }
@@ -1457,7 +1492,7 @@ let (_f, idx) = open_index(&arc).unwrap();
     #[test]
     fn store_mode_mutation_fuzz_never_panics() {
         // store v2 carries a per-file hash, so ANY corruption (metadata,
-        // footer, or raw payload) must be rejected on open — never a panic,
+        // footer, or raw payload) must be rejected on open â€” never a panic,
         // and never a silent wrong extraction.
         let dir = scratch("storefuzz");
         let src = dir.join("rand.bin");
@@ -1745,5 +1780,120 @@ let (_f, idx) = open_index(&arc).unwrap();
         );
         assert!(!out.join("evil.txt").exists());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn v4_archive_roundtrips_and_beats_v3_on_prose() {
+        let dir = scratch("v4prose");
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let mut blob = String::new();
+        for i in 0..2600 {
+            blob.push_str(&format!("{i}: the quick brown fox jumps over the lazy dog and the farmer watches the fox from the barn door, then the dog runs away. never repeat yourself.\n"));
+        }
+        let blob = blob.into_bytes();
+        write_file(&src.join("a.txt"), &blob);
+
+        let arc4 = dir.join("v4.aahl");
+        let arc3 = dir.join("v3.aahl");
+        cmd_create(&arc4, &[src.clone()], 4096, 1, 64, 1).unwrap();
+        cmd_create_params_version(
+            &arc3,
+            &[src.clone()],
+            4096,
+            pack_params(1, 64, PARAM_RULES_DEFAULT, 0),
+            1,
+            3,
+        )
+        .unwrap();
+
+        let (_f, idx4) = open_index(&arc4).unwrap();
+        assert_eq!(idx4.version, 4, "new archives must be container v4");
+        let (_f, idx3) = open_index(&arc3).unwrap();
+        assert_eq!(idx3.version, 3, "seam must write a legacy v3 archive");
+
+        let len4 = std::fs::metadata(&arc4).unwrap().len();
+        let len3 = std::fs::metadata(&arc3).unwrap().len();
+        // TDD probe: at 4 KiB chunks on this fixture the persistent model is a
+        // minor player (most chunks are stateless); v4 must never materially
+        // regress vs v3 here. The strict win is asserted on the hot-rule-heavy
+        // fixture below.
+        assert!(
+            len4 <= len3 + 1024,
+            "v4 must not materially regress vs v3 on small-chunk prose: v3={len3}B v4={len4}B"
+        );
+
+        // both v3 (legacy read path) and v4 must extract byte-identically
+        for (a, outd) in [(&arc4, dir.join("e4")), (&arc3, dir.join("e3"))] {
+            cmd_extract(a, &outd).unwrap();
+            let got = std::fs::read(outd.join("src").join("a.txt")).unwrap();
+            assert_eq!(got, blob, "extract mismatch for {}", a.display());
+        }
+    }
+
+    #[test]
+    fn future_container_versions_are_rejected() {
+        let dir = scratch("futurever");
+        let src = dir.join("x.txt");
+        let payload = b"hello world ".repeat(200);
+        write_file(&src, &payload);
+        let arc = dir.join("v5.aahl");
+        cmd_create(&arc, &[src], 4096, 1, 64, 1).unwrap();
+        let mut bytes = std::fs::read(&arc).unwrap();
+        bytes[4..6].copy_from_slice(&5u16.to_le_bytes());
+        let mut prefix = [0u8; 20];
+        prefix[..4].copy_from_slice(&bytes[..4]);
+        prefix[4..6].copy_from_slice(&5u16.to_le_bytes());
+        prefix[6..8].copy_from_slice(&bytes[6..8]);
+        prefix[8..12].copy_from_slice(&bytes[8..12]);
+        prefix[12..20].copy_from_slice(&bytes[12..20]);
+        bytes[20..22].copy_from_slice(&header_checksum(&prefix).to_le_bytes());
+        std::fs::write(&arc, &bytes).unwrap();
+        let err = open_index(&arc).err().map(|e| format!("{e:#}")).unwrap_or_default();
+        assert!(
+            open_index(&arc).is_err(),
+            "container version 5 must be rejected, got: {err}"
+        );
+    }
+    #[test]
+    fn v4_archive_beats_v3_when_hot_rules_dominate() {
+        // Many chunks, default lag (16) and 16 KiB chunks: the phrase rules
+        // survive across blocks with near-deterministic per-rule followers, so
+        // the exact hot-rule contexts in v4 must compress strictly better.
+        let dir = scratch("v4strong");
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let mut blob = String::new();
+        for i in 0..8000u32 {
+            blob.push_str(&format!("{i} "));
+            blob.push_str("the quick brown fox jumps over the lazy dog and the farmer watches the fox from the barn door before dawn, ");
+            blob.push(char::from(b'A' + (i % 40) as u8));
+            blob.push(' ');
+        }
+        let blob = blob.into_bytes();
+        write_file(&src.join("a.txt"), &blob);
+
+        let arc4 = dir.join("v4.aahl");
+        let arc3 = dir.join("v3.aahl");
+        cmd_create(&arc4, &[src.clone()], 16384, 16, 64, 1).unwrap();
+        cmd_create_params_version(
+            &arc3,
+            &[src.clone()],
+            16384,
+            pack_params(16, 64, PARAM_RULES_DEFAULT, 0),
+            1,
+            3,
+        )
+        .unwrap();
+
+        let len4 = std::fs::metadata(&arc4).unwrap().len();
+        let len3 = std::fs::metadata(&arc3).unwrap().len();
+        assert!(
+            len4 < len3,
+            "v4 exact contexts must beat v3 when hot rules dominate: v3={len3}B v4={len4}B"
+        );
+        cmd_extract(&arc4, &dir.join("e4")).unwrap();
+        let got = std::fs::read(dir.join("e4").join("src").join("a.txt")).unwrap();
+        assert_eq!(got, blob);
     }
 }

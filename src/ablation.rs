@@ -1,4 +1,4 @@
-//! Scientific ablation harness.
+﻿//! Scientific ablation harness.
 //!
 //! For each corpus directory and each chunk size, this module computes the
 //! payload that every pipeline component would produce over the *unique* chunk
@@ -107,7 +107,9 @@ fn run_grammar(
         aahl::FoldConfig::default()
     };
     // Default create params: lag 16, GC every 64 chunks (PARAM_* defaults).
-    let mut g = grammar::PersistentGrammar::with_lag(cfg, 64, 16);
+    // The persistent model ships as v4 (exact contexts for hot rules), so the
+    // ablation must measure the same flavor the archives use.
+    let mut g = grammar::PersistentGrammar::with_lag_v4(cfg, 64, 16);
     let t = Instant::now();
     let mut payload = 0usize;
     for p in pieces {

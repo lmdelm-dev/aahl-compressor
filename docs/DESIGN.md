@@ -1,4 +1,4 @@
-# AAHL design notes
+﻿# AAHL design notes
 
 High-level rationale for the pieces that make AAHL different from "a shell
 around zstd": the persistent folding grammar, snapshot lag, grammar GC, and
@@ -24,15 +24,15 @@ One grammar is owned by the whole archive. Chunks are fed in archive order on
 both create and extract, so the encoder and decoder walk identical rule tables.
 
 - `fold_stream` (`aahl.rs::fold*`) performs recursive pair merging
-  (`MIN_PAIR_COUNT >= 4` minimum pair agreement, capped by `MAX_MERGES=512`,
+  (`MIN_PAIR_COUNT >= 4` minimum pair agreement, capped by `MAX_MERGES=1024` (deep folding; see section 8),
   symbol ceiling `MAX_SYMS=4096`).
 - `reuse_pass` runs a byte-level trie over rule expansions (`MAX_PHRASE=256`),
   greedily replacing raw bytes with existing rule ids; `invent` creates new
   rules for recurring pairs and appends them to the table.
 - The model is an adaptive arithmetic coder whose alphabet grows as rules are
   invented and shrinks when GC renumbers survivors. `PersistentTokenModel`
-  (arith.rs) conditions each token on its predecessor — order-1 over grammar
-  tokens with bucketed rule contexts — and a blending variant adds order-2
+  (arith.rs) conditions each token on its predecessor â€” order-1 over grammar
+  tokens with bucketed rule contexts â€” and a blending variant adds order-2
   evidence once it is statistically justified (`O2_MIN_TOTAL` evidence gate).
 
 ### Why a *persistent* grammar beats per-block stateless
@@ -48,7 +48,7 @@ also why a grammar-GC exists at all: dead rules would otherwise accumulate.
 Every grammar block must beat `raw.len() + 6`; when it does not, the chunk is
 not merged. `bytes with entropy >= 7.9 bits` short-circuit to STORE raw blocks
 without paying fold cost. A whole archive whose compressed cost exceeds its raw
-size is rewritten as the STORE container (§SPEC 5). This is the honesty
+size is rewritten as the STORE container (Â§SPEC 5). This is the honesty
 mechanism: **compression never makes things bigger**.
 
 ## 3. Snapshot lag (encoder-only)
@@ -59,7 +59,7 @@ every G block carries the rule definitions it references, so lag only changes
 how far the encoder looks back.
 
 Why lag exists at all: it bounds the grammar snapshot a parallel worker has to
-clone (§4). With `lag=1` the encoder uses the live grammar directly (the legacy
+clone (Â§4). With `lag=1` the encoder uses the live grammar directly (the legacy
 serial path); the recompute-safety property still holds but the snapshot reuse
 window is one chunk.
 
@@ -74,7 +74,7 @@ Contracts:
 
 1. **Discovery is a pure function of (frozen snapshot, raw chunk).**
 2. **Commit is strictly serial**, on the main thread, in chunk order.
-3. The decoder never sees a fork prefix — it only ever reconstructs the live
+3. The decoder never sees a fork prefix â€” it only ever reconstructs the live
    table from transmitted definitions.
 
 `emit_parallel` runs a bounded `rayon` pool where worker `r` clones the rules
@@ -102,17 +102,17 @@ The decoder applies exactly the same remap (survivors renumbered 0..k'-1), so:
   way to detect "this candidate's frozen prefix belongs to a pre-remap table",
   even when snapshot lengths coincidentally match.
 
-The body is bounded defensively on read (§SPEC 3) and `apply_gc` rebuilds the
+The body is bounded defensively on read (Â§SPEC 3) and `apply_gc` rebuilds the
 pair index/trie so no stale rule id can survive a remap.
 
 ## 6. Integrity model
 
 - Every unique chunk is stored once with its blake3 `hash` in the DATA record
   header; extraction decodes the block and verifies length + hash before use.
-  A corrupted block errors out — it cannot produce silently wrong file bytes.
+  A corrupted block errors out â€” it cannot produce silently wrong file bytes.
 - The v3 header carries a blake3-derived u16 checksum, so `chunk_size`/`params`
   corruption is caught before it drives allocation.
-- STORE v2 carries per-file blake3 in the table (§SPEC 5.1) precisely because
+- STORE v2 carries per-file blake3 in the table (Â§SPEC 5.1) precisely because
   v1 proved that metadata shifts (`path_len`) corrupt payload slicing silently.
 - The footer's `table_offset`/`table_len` must land exactly; a truncated or
   trailing-junk archive is rejected.
@@ -150,11 +150,48 @@ per chunk. `decompress_block` dispatches on the leading tag byte.
   lose at 262144; RULE_CTX is a format-level constant, so changing it would
   break v3 read-compat for existing archives. Kept at 8.
 
+## 8.1 The v4 token model (exact hot-rule contexts)
+
+The persistent model originally hashed every rule id into 8 order-1 buckets
+(RULE_CTX=8, ~128 rules/bucket at 1k rules, near-flat priors). v4 splits rule
+contexts into three regimes (format constants, see SPEC 2.2):
+
+- **Literal symbols (ids < 256)**: order-1 as before.
+- **Hot window (rule ids in the first HOT_RULES=192 ids)**: one *exact*
+  context per rule. After GC renumbering the lowest ids are the longest-lived
+  cross-chunk anchors, so their follower distributions win the most from
+  exactness. 192 is < 1 model MiB of table space and covers the persistent
+  core of typical text/code corpora.
+- **Cold tail (ids >= 256 + 192)**: hashed into 8 buckets exactly as v3 (so
+  the cold regime is provably no worse than the legacy model).
+
+The context is a pure function of (symbol, mode) - never of alphabet size -
+which is what keeps encoder/decoder contexts identical across grow/shrink and
+GC renumbering. The v4 mapping is opt-in at grammar construction (`new_v4`);
+`new()`/`with_gc()` remain v3, and a v3 archive extracts byte-identically on a
+v4 reader.
+
+Measured contribution (ablation, HOT_RULES=192, chunk 1 MiB): text-large is
+stateless-equivalent (its grammar is rarely paid for in full), while table
+gains ~0.5% (1,682,478 -> 1,673,892 payload). The grid position across
+HOT_RULES in [64, 256] is flat because table's rule->rule followers are
+near-uniform there is no "hot few" to exploit; the model's exactness matters
+for rule-dominant streams where consecutive chunks reuse the same phrase rules
+(covered by `tests_v4_model`, `v4_archive_beats_v3_when_hot_rules_dominate`).
+
+### Default chunk size: 1 MiB
+
+`create` shipped 64 KiB chunks. The ablation sweep (chunk 64 KiB -> 1 MiB at
+MAX_MERGES=1024, v4) is monotonic for both flagship corpora and takes text-large
+from 0.300 to 0.236 ratio at defaults - outpassing xz/7z9/zstd - while table
+improves 1,979,079 -> 1,673,892. 1 MiB is the top of the allowed range (fold is
+O(n*m)); the default is set there because the evidence is monotone up to it and
+there is no smaller chunk that beats zstd on the text lane.
 ## 9. Bench methodology
 
-`bench` compresses each corpus set five ways when reference tools exist —
+`bench` compresses each corpus set five ways when reference tools exist â€”
 `aahl`, `zip6` (7z deflate -mx=6), `7z9` (7z LZMA2 -mx=9), `xz -9` (concatenated
-stream), `zstd -19` (concatenated stream) — and verifies every round trip by
+stream), `zstd -19` (concatenated stream) â€” and verifies every round trip by
 blake3 hash comparison over the extracted/concat stream before recording a row.
 Rows are fair on shape (file-by-file integrity for AAHL and 7z; for stream
 codecs, valid compressed stream with the same bytes, hashes checked). A
@@ -183,5 +220,5 @@ real source/binaries/installer files.
 - **Encryption**: intentionally separate. The archive is checksummed but not
   sealed; compress-then-encrypt any tool (age/gpg) preserves blake3 integrity.
 - **Multivolume / split archives**: nothing in the format prevents splitting
-  on record boundaries, but the store-fallback rewrite (§SPEC 1.1) happens
+  on record boundaries, but the store-fallback rewrite (Â§SPEC 1.1) happens
   after full compression, so volume sizing must negotiate after create.
