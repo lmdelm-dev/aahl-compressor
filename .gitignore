@@ -1,2 +1,6 @@
 ﻿/target
+/corpus_set
+/bench_results.tsv
+/work
+/t.log
 

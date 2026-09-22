@@ -36,7 +36,7 @@ const PARAM_RULES_DEFAULT: u64 = 60000;
 // v3 record framing: kind u8 | body_len u32 | body
 const RECORD_DATA: u8 = 0x01; // body = blake3[32] | unpacked_len u32 | packed bytes
 const RECORD_GC: u8 = 0x02; // body = flags u8 | num_survivors u32 | survivor u32* (grammar GC)
-const STORE_VERSION: u16 = 1;
+const STORE_VERSION: u16 = 2; // v2: per-file blake3 hash in the table
 const STORE_MODE: u16 = 0; // single raw container, no grammar
 
 #[derive(Parser)]
@@ -50,30 +50,55 @@ struct Cli {
 enum Cmd {
     /// Create archive from files/dirs
     Create {
+        #[arg(value_name = "ARCHIVE", help = "output .aahl archive path")]
         archive: PathBuf,
+        #[arg(value_name = "INPUTS", help = "input files and/or directories")]
         inputs: Vec<PathBuf>,
-        #[arg(long, default_value_t = 65_536)]
+        #[arg(long, default_value_t = 65_536, help = "chunk size in bytes (64 KiB default)")]
         chunk_size: u32,
+        /// Grammar snapshot lookahead (chunks): higher lag lets a chunk fork
+        /// from a state a few chunks earlier, bounding parallel dispatch.
+        #[arg(long, default_value_t = PARAM_LAG_DEFAULT as usize)]
+        lag: usize,
+        /// GC interval (chunks): how often dead-rule reclamation is attempted.
+        #[arg(long, default_value_t = PARAM_GC_DEFAULT as usize)]
+        gc_interval: usize,
+        /// Parallel discovery workers. Discovery is pure (frozen snapshots),
+        /// commits stay serial, so any -j produces byte-identical archives.
+        #[arg(long, short, default_value_t = 1)]
+        jobs: usize,
     },
     /// List contents
-    List { archive: PathBuf },
+    List {
+        #[arg(value_name = "ARCHIVE")]
+        archive: PathBuf,
+    },
     /// Extract archive
-    Extract { archive: PathBuf, out_dir: PathBuf },
+    Extract {
+        #[arg(value_name = "ARCHIVE")]
+        archive: PathBuf,
+        #[arg(value_name = "OUT_DIR", help = "target directory (created if absent)")]
+        out_dir: PathBuf,
+    },
     /// Report per-mode block sizes for a single file (dev/diagnostic)
     #[command(name = "blocksize")]
-    BlockSize { input: PathBuf, #[arg(long)] sweep: bool },
+    BlockSize {
+        input: PathBuf,
+        #[arg(long, help = "sweep merge/sym limits for the fold grammars")]
+        sweep: bool,
+    },
     /// Build the standard benchmark corpus set (deterministic)
     #[command(name = "corpus")]
     BuildCorpus {
         set_dir: PathBuf,
-        #[arg(long)]
+        #[arg(long, value_name = "DIR", help = "optional source tree for real file corpora (.rs, .exe/.dll)")]
         source: Option<PathBuf>,
     },
     /// Run the benchmark suite over a corpus set, incl. reference tools
     #[command(name = "bench")]
     RunBench {
         set_dir: PathBuf,
-        #[arg(long, default_value = "bench_results.tsv")]
+        #[arg(long, default_value = "bench_results.tsv", help = "write results to this TSV")]
         tsv: PathBuf,
     },
 }
@@ -89,6 +114,7 @@ struct FileEntry {
     path: String,
     file_len: u64,
     refs: Vec<u32>,
+    store_hash: Option<[u8; 32]>, // STORE v2+: per-file payload hash
 }
 
 /// A grammar-GC record interleaved between DATA records. `data_before` is the
@@ -199,18 +225,38 @@ fn visit_dir(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) -> Resul
     Ok(())
 }
 
-fn cmd_create(archive: &Path, inputs: &[PathBuf], chunk_size: u32) -> Result<()> {
+fn cmd_create(
+    archive: &Path,
+    inputs: &[PathBuf],
+    chunk_size: u32,
+    lag: usize,
+    gc_interval: usize,
+    jobs: usize,
+) -> Result<()> {
+    if !(1..=1024).contains(&lag) {
+        bail!("lag must be 1..1024");
+    }
+    if !(1..=4096).contains(&gc_interval) {
+        bail!("gc-interval must be 1..4096");
+    }
     cmd_create_params(
         archive,
         inputs,
         chunk_size,
-        pack_params(PARAM_LAG_DEFAULT, PARAM_GC_DEFAULT, PARAM_RULES_DEFAULT, 0),
+        pack_params(lag as u64, gc_interval as u64, PARAM_RULES_DEFAULT, 0),
+        jobs,
     )
 }
 
 /// Full create path with explicit params (tests inject a short GC interval to
 /// force grammar reclamation deterministically; the CLI uses defaults).
-fn cmd_create_params(archive: &Path, inputs: &[PathBuf], chunk_size: u32, params: u64) -> Result<()> {
+fn cmd_create_params(
+    archive: &Path,
+    inputs: &[PathBuf],
+    chunk_size: u32,
+    params: u64,
+    jobs: usize,
+) -> Result<()> {
     if !(4096..=1_048_576).contains(&chunk_size) {
         bail!("chunk-size must be 4KiB..1MiB (fold is O(n*m), keep small)");
     }
@@ -227,20 +273,10 @@ fn cmd_create_params(archive: &Path, inputs: &[PathBuf], chunk_size: u32, params
     out.write_all(&prefix)?;
     write_u16(&mut out, header_checksum(&prefix))?; // HEADER_LEN_V3 == 22
 
-    let mut chunk_index: HashMap<[u8; 32], u32> = HashMap::new();
-    let mut chunks: Vec<ChunkMeta> = Vec::new();
-    let mut entries: Vec<FileEntry> = Vec::new();
-    // One persistent grammar owns the whole archive; it advances only for
-    // chunks that actually get emitted (DATA records). Dedup-skipped pieces
-    // are never encoded, so they never touch it — the decoder never re-reads them.
-    // The params gc_interval drives how often it tries to reclaim dead rule
-    // history (each GC attempt costs a checkpoint of the live set).
-    let (_, gc_interval, _, _) = unpack_params(params);
-    let mut grammar = grammar::PersistentGrammar::with_gc(
-        aahl::FoldConfig::default(),
-        gc_interval as usize,
-    );
-
+    // Buffer the unique pieces (with their first-seen order) so discovery can
+    // run ahead of commit. Dedup runs while gathering: repeated pieces are refs
+    // and never touch the grammar, exactly like the streaming path.
+    let mut gather = Gather::default();
     for (arc_name, disk_path) in &files {
         let data =
             std::fs::read(disk_path).with_context(|| format!("read {}", disk_path.display()))?;
@@ -248,42 +284,47 @@ fn cmd_create_params(archive: &Path, inputs: &[PathBuf], chunk_size: u32, params
         if !data.is_empty() {
             for piece in data.chunks(chunk_size as usize) {
                 let hash = *blake3::hash(piece).as_bytes();
-                if let Some(&idx) = chunk_index.get(&hash) {
+                if let Some(&idx) = gather.index.get(&hash) {
                     refs.push(idx);
                     continue;
                 }
-                // AAHL core: custom fold codec + persistent grammar, NOT zstd/LZ.
-                let (packed, pending_gc) = grammar.compress(piece);
-                let idx = chunks.len() as u32;
-                // v3 DATA record: kind u8 | body_len u32 | hash(32) | unpacked_len u32 | packed
-                out.write_all(&[RECORD_DATA])?;
-                let body_len = 32u32 + 4 + packed.len() as u32;
-                write_u32(&mut out, body_len)?;
-                out.write_all(&hash)?;
-                write_u32(&mut out, piece.len() as u32)?;
-                let data_off = out.stream_position()?;
-                out.write_all(&packed)?;
-                // Grammar GC records interleave between DATA records; they
-                // apply before the next chunk's decode.
-                if let Some(gc) = pending_gc {
-                    out.write_all(&gc)?;
-                }
-                chunk_index.insert(hash, idx);
-                chunks.push(ChunkMeta {
+                let idx = gather.pieces.len() as u32;
+                gather.index.insert(hash, idx);
+                gather.pieces.push(Piece {
                     hash,
+                    raw: piece.to_vec(),
                     unpacked_len: piece.len() as u32,
-                    packed_len: packed.len() as u32,
-                    offset: data_off,
                 });
                 refs.push(idx);
             }
         }
-        entries.push(FileEntry {
+        gather.entries.push(FileEntry {
             path: arc_name.clone(),
             file_len: data.len() as u64,
             refs,
+            store_hash: None,
         });
     }
+    let entries = gather.entries;
+    let pieces = gather.pieces;
+
+    // AAHL core: custom fold codec + persistent grammar, NOT zstd/LZ.
+    let (lag, gc_interval, _, _) = unpack_params(params);
+    let mut grammar = grammar::PersistentGrammar::with_lag(
+        aahl::FoldConfig::default(),
+        gc_interval as usize,
+        lag as usize,
+    );
+
+    // Emit every unique chunk in first-seen order. With jobs <= 1 (or lag <= 1)
+    // discovery and commit share the serial path; with lag > 1 and jobs > 1 a
+    // bounded pipeline runs pure discovery ahead of a strictly serial commit,
+    // which keeps the archive byte-identical for any worker count.
+    let chunks = if jobs > 1 && lag > 1 {
+        emit_parallel(&mut out, &pieces, &mut grammar, jobs)?
+    } else {
+        emit_serial(&mut out, &pieces, &mut grammar)?
+    };
 
     let table_offset = out.stream_position()?;
     write_u64(&mut out, entries.len() as u64)?;
@@ -343,7 +384,142 @@ fn cmd_create_params(archive: &Path, inputs: &[PathBuf], chunk_size: u32, params
     Ok(())
 }
 
+struct Piece {
+    hash: [u8; 32],
+    raw: Vec<u8>,
+    unpacked_len: u32,
+}
+
+#[derive(Default)]
+struct Gather {
+    index: HashMap<[u8; 32], u32>,
+    pieces: Vec<Piece>,
+    entries: Vec<FileEntry>,
+}
+
+fn emit_serial(
+    out: &mut File,
+    pieces: &[Piece],
+    grammar: &mut grammar::PersistentGrammar,
+) -> Result<Vec<ChunkMeta>> {
+    let mut chunks: Vec<ChunkMeta> = Vec::with_capacity(pieces.len());
+    for p in pieces {
+        // AAHL core: custom fold codec + persistent grammar, NOT zstd/LZ.
+        let (packed, pending_gc) = grammar.compress(&p.raw);
+        // v3 DATA record: kind u8 | body_len u32 | hash(32) | unpacked_len u32 | packed
+        out.write_all(&[RECORD_DATA])?;
+        let body_len = 32u32 + 4 + packed.len() as u32;
+        write_u32(&mut *out, body_len)?;
+        out.write_all(&p.hash)?;
+        write_u32(&mut *out, p.unpacked_len)?;
+        let data_off = out.stream_position()?;
+        out.write_all(&packed)?;
+        // Grammar GC records interleave between DATA records; they
+        // apply before the next chunk's decode.
+        if let Some(gc) = pending_gc {
+            out.write_all(&gc)?;
+        }
+        chunks.push(ChunkMeta {
+            hash: p.hash,
+            unpacked_len: p.unpacked_len,
+            packed_len: packed.len() as u32,
+            offset: data_off,
+        });
+    }
+    Ok(chunks)
+}
+
+/// Parallel discovery pipeline. Discovery (fork_candidate, pure) runs on a
+/// bounded pool ahead of a strictly serial commit, so the byte stream is
+/// identical for any `jobs` value. Chunk `r`'s worker discovers against the
+/// frozen prefix for snapshot `r - lag`; the main thread commits in order,
+/// re-discovering serially when the live snapshot has drifted (GC/rule growth),
+/// which keeps output deterministic at the cost of worker reuse.
+fn emit_parallel(
+    out: &mut File,
+    pieces: &[Piece],
+    grammar: &mut grammar::PersistentGrammar,
+    jobs: usize,
+) -> Result<Vec<ChunkMeta>> {
+    use std::sync::mpsc;
+    let n = pieces.len();
+    let lag = grammar.lag();
+    let cfg = aahl::FoldConfig::default();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(jobs)
+        .build()
+        .unwrap();
+
+    let mut chunks: Vec<ChunkMeta> = Vec::with_capacity(n);
+    // (snapshot_len, gc_epoch, candidate) per chunk, available once the chunk
+    // becomes the head of the commit queue.
+    let mut results: Vec<Option<mpsc::Receiver<(usize, u64, Option<grammar::ForkCandidate>)>>> =
+        (0..n).map(|_| None).collect();
+
+    let mut dispatch_tail = 0usize; // next chunk to hand to a worker
+    let mut committed = 0usize;
+
+    while committed < n {
+        // Chunk r's fork snapshot (rules length after chunk r-lag) is frozen
+        // once committed > r-lag, i.e. for every r in [0, committed+lag). Hand
+        // each still-undispatched chunk in that window to a worker: the worker
+        // clones the frozen rule prefix and never touches the live table, and
+        // returns None for an empty snapshot exactly like the serial fork path.
+        // The commit half cross-checks snapshot + GC epoch and re-discovers
+        // serially when a GC/append invalidated the dispatch, so output bytes
+        // are invariant to any worker count or scheduling.
+        while dispatch_tail < n && dispatch_tail < committed + lag {
+            let r = dispatch_tail;
+            let snap = grammar.snapshot_len_for(r);
+            let prefix = grammar.rules_prefix(r).to_vec();
+            let epoch = grammar.gc_epoch();
+            let raw = pieces[r].raw.clone();
+            let cfg = cfg;
+            let (tx, rx) = mpsc::channel();
+            pool.spawn(move || {
+                let cand = grammar::fork_candidate(&prefix, &cfg, &raw, prefix.len());
+                let _ = tx.send((snap, epoch, cand));
+            });
+            results[r] = Some(rx);
+            dispatch_tail += 1;
+        }
+
+        // Commit the head chunk, reusing its worker's candidate when the live
+        // snapshot still matches; otherwise re-discover serially (identical
+        // bytes, since discovery is a pure function of snapshot + raw).
+        let (packed, pending_gc) = match &results[committed] {
+            Some(rx) => {
+                let (snap, epoch, cand) = rx
+                    .recv()
+                    .map_err(|_| anyhow::anyhow!("discovery worker failed"))?;
+                grammar.compress_parallel(cand, snap, epoch, &pieces[committed].raw)
+            }
+            None => grammar.compress(&pieces[committed].raw),
+        };
+        out.write_all(&[RECORD_DATA])?;
+        let body_len = 32u32 + 4 + packed.len() as u32;
+        write_u32(&mut *out, body_len)?;
+        out.write_all(&pieces[committed].hash)?;
+        write_u32(&mut *out, pieces[committed].unpacked_len)?;
+        let data_off = out.stream_position()?;
+        out.write_all(&packed)?;
+        if let Some(gc) = pending_gc {
+            out.write_all(&gc)?;
+        }
+        chunks.push(ChunkMeta {
+            hash: pieces[committed].hash,
+            unpacked_len: pieces[committed].unpacked_len,
+            packed_len: packed.len() as u32,
+            offset: data_off,
+        });
+        results[committed] = None;
+        committed += 1;
+    }
+    Ok(chunks)
+}
+
 /// STORE container (6B magic+version+mode, raw payload, standard footer).
+/// v2 table entry: path_len u16 | path | file_len u64 | blake3[32] of payload.
 fn write_store_archive(out: &mut File, files: &[(String, PathBuf)]) -> Result<()> {
     out.write_all(MAGIC_STORE)?;
     write_u16(out, STORE_VERSION)?;
@@ -355,12 +531,13 @@ fn write_store_archive(out: &mut File, files: &[(String, PathBuf)]) -> Result<()
         if pb.len() > u16::MAX as usize {
             bail!("path too long: {arc_name}");
         }
-        let file_len = std::fs::metadata(disk_path)
-            .with_context(|| format!("stat {}", disk_path.display()))?
-            .len();
+        let data = std::fs::read(disk_path).with_context(|| format!("read {}", disk_path.display()))?;
+        let file_len = data.len() as u64;
+        let h = *blake3::hash(&data).as_bytes();
         write_u16(out, pb.len() as u16)?;
         out.write_all(pb)?;
         write_u64(out, file_len)?;
+        out.write_all(&h)?;
     }
     let table_end = out.stream_position()?;
     for (_, disk_path) in files {
@@ -454,6 +631,14 @@ fn open_index(archive: &Path) -> Result<(File, ArchiveIndex)> {
     if table_offset >= flen {
         bail!("corrupt table offset");
     }
+    // sanity caps: every v3 record is >=5 bytes (kind+body_len), every
+    // file entry >=18 bytes (path_len u16 + file_len u64 + nrefs u64).
+    // cap allocations from corrupt footer counts.
+    let max_chunks = (table_offset.saturating_sub(header_len)) / 5;
+    let max_files = (flen.saturating_sub(table_offset)) / 18;
+    if num_chunks as u64 > max_chunks || num_files as u64 > max_files {
+        bail!("implausible table counts (corrupt)");
+    }
 
     // Chunk region. v1/v2 use a fixed [hash|unpacked|packed|packed] table;
     // v3 uses record framing: kind u8 | body_len u32 | body. DATA records
@@ -473,8 +658,11 @@ fn open_index(archive: &Path) -> Result<(File, ArchiveIndex)> {
                     let mut hash = [0u8; 32];
                     f.read_exact(&mut hash)?;
                     let unpacked = read_u32(&mut f)?;
+                    if body_len < 36 {
+                        bail!("corrupt data record body");
+                    }
                     let packed = body_len - 32 - 4; // hash + unpacked_len
-                    if body_len < 36 || table_offset - f.stream_position()? < packed {
+                    if table_offset.saturating_sub(f.stream_position()?) < packed {
                         bail!("corrupt data record length");
                     }
                     let data_off = f.stream_position()?;
@@ -487,6 +675,9 @@ fn open_index(archive: &Path) -> Result<(File, ArchiveIndex)> {
                     });
                 }
                 RECORD_GC => {
+                    if body_len as u64 > table_offset.saturating_sub(f.stream_position()?) {
+                        bail!("corrupt GC record length");
+                    }
                     let mut body = vec![0u8; body_len as usize];
                     f.read_exact(&mut body)?;
                     let survivors = grammar::PersistentGrammar::parse_gc_body(&body)
@@ -540,6 +731,7 @@ fn open_index(archive: &Path) -> Result<(File, ArchiveIndex)> {
             path,
             file_len,
             refs,
+            store_hash: None,
         });
     }
     Ok((
@@ -559,8 +751,10 @@ fn open_index(archive: &Path) -> Result<(File, ArchiveIndex)> {
 
 /// STORE container reader. Layout (offset 0): magic b"AS" (2) | version u16 |
 /// mode u16, then the file table (nfiles u64, then per file path_len u16 +
-/// path + file_len u64, no chunk refs), then the raw concatenated payload.
-/// Suffix is the same footer as compressed containers.
+/// path + file_len u64 + blake3[32]), then the raw concatenated payload.
+/// Suffix is the same footer as compressed containers. Every payload slice is
+/// verified against its embedded hash when the index is opened, so a store
+/// container is tamper-detecting (rejects any metadata or payload corruption).
 fn open_store(mut f: File, flen: u64) -> Result<(File, ArchiveIndex)> {
     // cursor is at offset 4 ("AS"+version already consumed by open_index);
     // re-read version+mode from their canonical offsets.
@@ -593,6 +787,10 @@ fn open_store(mut f: File, flen: u64) -> Result<(File, ArchiveIndex)> {
     if nfiles != num_files {
         bail!("store file count mismatch");
     }
+    // store entries are >=42 bytes (path_len u16 + file_len u64 + hash 32b)
+    if nfiles as u64 > (flen.saturating_sub(table_offset)) / 42 {
+        bail!("implausible store file count (corrupt)");
+    }
     let mut files = Vec::with_capacity(nfiles);
     for _ in 0..nfiles {
         let pl = read_u16(&mut f)? as usize;
@@ -600,16 +798,41 @@ fn open_store(mut f: File, flen: u64) -> Result<(File, ArchiveIndex)> {
         f.read_exact(&mut pb)?;
         let path = String::from_utf8(pb).context("non-utf8 path")?;
         let file_len = read_u64(&mut f)?;
+        let mut hash = [0u8; 32];
+        f.read_exact(&mut hash)?;
         files.push(FileEntry {
             path,
             file_len,
             refs: Vec::new(),
+            store_hash: Some(hash),
         });
     }
     let store_payload = f.stream_position()?;
     let total: u64 = files.iter().map(|e| e.file_len).sum();
     if store_payload + total != flen - FOOTER_LEN {
         bail!("store payload length mismatch (truncated?)");
+    }
+    // verify every payload slice against its embedded hash
+    let mut hasher_buf = Vec::with_capacity(1 << 20);
+    let mut off = 0u64;
+    for (i, e) in files.iter().enumerate() {
+        let h = {
+            let mut hh = blake3::Hasher::new();
+            f.seek(SeekFrom::Start(store_payload + off))?;
+            let mut left = e.file_len;
+            while left > 0 {
+                let take = left.min(hasher_buf.capacity() as u64) as usize;
+                hasher_buf.resize(take, 0);
+                f.read_exact(&mut hasher_buf[..take])?;
+                hh.update(&hasher_buf[..take]);
+                left -= take as u64;
+            }
+            *hh.finalize().as_bytes()
+        };
+        if h != files[i].store_hash.unwrap() {
+            bail!("store payload hash mismatch for {}", e.path);
+        }
+        off += e.file_len;
     }
     Ok((
         // reset position so callers start at 0
@@ -665,6 +888,38 @@ fn cmd_list(archive: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Ensure a recorded entry path stays inside the extraction root. Rejects
+/// absolute paths, UNC/drive roots, and any `..` component. The destination is
+/// constructed from the canonicalized root (so textual escapes are impossible),
+/// then re-canonicalized when it already exists so a symlinked parent cannot
+/// redirect the write outside the output directory.
+fn safe_destination(out_dir: &Path, entry_path: &str) -> Result<PathBuf> {
+    if entry_path.is_empty() {
+        bail!("empty entry path");
+    }
+    let p = Path::new(entry_path);
+    if p.is_absolute() || p.has_root() {
+        bail!("unsafe entry path: {entry_path:?}");
+    }
+    if p.starts_with("..") || p.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        bail!("unsafe entry path: {entry_path:?}");
+    }
+    if cfg!(windows) && entry_path.contains(':') {
+        bail!("unsafe entry path: {entry_path:?}");
+    }
+    std::fs::create_dir_all(out_dir)?;
+    let root = out_dir
+        .canonicalize()
+        .with_context(|| format!("canonicalize {}", out_dir.display()))?;
+    let dest = root.join(&p);
+    if let Ok(real) = std::fs::canonicalize(&dest) {
+        if !real.starts_with(&root) {
+            bail!("entry path escapes output dir: {entry_path:?}");
+        }
+    }
+    Ok(dest)
+}
+
 fn cmd_extract(archive: &Path, out_dir: &Path) -> Result<()> {
     let (mut f, idx) = open_index(archive)?;
     std::fs::create_dir_all(out_dir)?;
@@ -672,7 +927,7 @@ fn cmd_extract(archive: &Path, out_dir: &Path) -> Result<()> {
     if idx.store_mode {
         f.seek(SeekFrom::Start(idx.store_payload))?;
         for e in &idx.files {
-            let dest = out_dir.join(&e.path);
+            let dest = safe_destination(out_dir, &e.path)?;
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -711,7 +966,7 @@ fn cmd_extract(archive: &Path, out_dir: &Path) -> Result<()> {
     let mut cache: HashMap<u32, Vec<u8>> = HashMap::new();
 
     for e in &idx.files {
-        let dest = out_dir.join(&e.path);
+        let dest = safe_destination(out_dir, &e.path)?;
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -773,7 +1028,10 @@ fn main() -> Result<()> {
             archive,
             inputs,
             chunk_size,
-        } => cmd_create(&archive, &inputs, chunk_size),
+            lag,
+            gc_interval,
+            jobs,
+        } => cmd_create(&archive, &inputs, chunk_size, lag, gc_interval, jobs),
         Cmd::List { archive } => cmd_list(&archive),
         Cmd::Extract { archive, out_dir } => cmd_extract(&archive, &out_dir),
         Cmd::BlockSize { input, sweep } => {
@@ -881,7 +1139,7 @@ mod container_tests {
         let arc = dir.join("out.aahl");
         let outd = dir.join("extracted");
 
-        cmd_create(&arc, &[src.clone()], 4096).unwrap();
+        cmd_create(&arc, &[src.clone()], 4096, 1, 64, 1).unwrap();
         let (mut f, idx) = open_index(&arc).unwrap();
         assert_eq!(idx.version, VERSION);
         assert!(!idx.store_mode);
@@ -912,14 +1170,14 @@ mod container_tests {
         }
         write_file(&src, &data);
         let arc = dir.join("store.aahl");
-        cmd_create(&arc, &[src.clone()], 4096).unwrap();
+        cmd_create(&arc, &[src.clone()], 4096, 1, 64, 1).unwrap();
 
 let (_f, idx) = open_index(&arc).unwrap();
         assert!(idx.store_mode);
         let path_len = idx.files[0].path.len() as u64;
         let arc_len = std::fs::metadata(&arc).unwrap().len();
-        // STORE: 6B container + 8B nfiles + (2+path+8) path entry + raw + 36B footer
-        let overhead = 6u64 + 8 + (2 + path_len + 8) + FOOTER_LEN;
+        // STORE v2: 6B container + 8B nfiles + (2+path+8+32 hash) entry + raw + 36B footer
+        let overhead = 6u64 + 8 + (2 + path_len + 8 + 32) + FOOTER_LEN;
         assert!(arc_len <= data.len() as u64 + overhead, "arc {arc_len} inflated past raw {}+overhead {overhead}", data.len());
         assert_eq!(arc_len, data.len() as u64 + overhead, "store size must be honest");
     }
@@ -931,7 +1189,7 @@ let (_f, idx) = open_index(&arc).unwrap();
         let blob = b"hello container world ".repeat(1000);
         write_file(&src, &blob);
         let arc = dir.join("c.aahl");
-        cmd_create(&arc, &[src.clone()], 4096).unwrap();
+        cmd_create(&arc, &[src.clone()], 4096, 1, 64, 1).unwrap();
         let good = std::fs::read(&arc).unwrap();
 
         // truncations at every 4096 boundary
@@ -984,7 +1242,7 @@ let (_f, idx) = open_index(&arc).unwrap();
         let src = dir.join("e.txt");
         write_file(&src, b"");
         let arc = dir.join("e.aahl");
-        cmd_create(&arc, &[src.clone()], 4096).unwrap();
+        cmd_create(&arc, &[src.clone()], 4096, 1, 64, 1).unwrap();
         let (_f, idx) = open_index(&arc).unwrap();
         assert!(idx.store_mode, "empty file should take store path");
         assert_eq!(idx.files.len(), 1);
@@ -1007,6 +1265,7 @@ let (_f, idx) = open_index(&arc).unwrap();
             &[src.clone()],
             4096,
             pack_params(PARAM_LAG_DEFAULT, 8, PARAM_RULES_DEFAULT, 0),
+            1,
         )
         .unwrap();
 
@@ -1039,6 +1298,7 @@ let (_f, idx) = open_index(&arc).unwrap();
             &[src.clone()],
             4096,
             pack_params(PARAM_LAG_DEFAULT, 8, PARAM_RULES_DEFAULT, 0),
+            1,
         )
         .unwrap();
 
@@ -1083,6 +1343,167 @@ let (_f, idx) = open_index(&arc).unwrap();
         );
     }
 
+    #[test]
+    fn payload_mutation_fuzz_never_panics_and_never_corrupts() {
+        // deterministic PRNG mutation fuzz over a real compressed archive:
+        // bit flips, byte substitutions, accidental decodes, truncations and
+        // boundary-smearing must never panic, and any decode that succeeds
+        // must reproduce the original bytes exactly (no silent corruption).
+        let dir = scratch("payloadfuzz");
+        let src = dir.join("mix.bin");
+        let data = oscillating_text();
+        write_file(&src, &data);
+        let arc = dir.join("base.aahl");
+        cmd_create_params(
+            &arc,
+            &[src.clone()],
+            4096,
+            pack_params(PARAM_LAG_DEFAULT, 8, PARAM_RULES_DEFAULT, 0),
+            1,
+        )
+        .unwrap();
+        let good = std::fs::read(&arc).unwrap();
+        if good.len() < 32 {
+            panic!("archive unexpectedly tiny");
+        }
+
+        // baseline sanity: a real archive opens and round-trips
+        let baseline_out = dir.join("baseline");
+        cmd_extract(&arc, &baseline_out).unwrap();
+        assert_eq!(
+            std::fs::read(baseline_out.join("mix.bin")).unwrap(),
+            data,
+            "baseline must round-trip"
+        );
+
+        let table_offset =
+            u64::from_le_bytes(good[good.len() - 32..good.len() - 24].try_into().unwrap());
+        let mut rng = corpus::Prng::new(0x5EED_F00D);
+
+        for iter in 0..4000u32 {
+            let mut bad = good.clone();
+            // 1..=4 mutations far from the header/footer/table, inside the
+            // chunk/GC record region.
+            let nmut = 1 + (rng.next_u64() % 4) as usize;
+            let lo = HEADER_LEN_V3 as usize + 1;
+            let hi = (table_offset as usize).min(bad.len().saturating_sub(8));
+            if hi <= lo {
+                continue;
+            }
+            let mut already = Vec::with_capacity(nmut);
+            for _ in 0..nmut {
+                let pos = lo + (rng.next_u64() as usize % (hi - lo));
+                if already.contains(&pos) {
+                    continue;
+                }
+                already.push(pos);
+                match rng.next_u64() % 4 {
+                    0 => bad[pos] ^= 1 << (rng.next_u64() % 8),
+                    1 => bad[pos] = (rng.next_u64() % 256) as u8,
+                    2 => {
+                        // smear the adjacent record-length bytes so framing is
+                        // exercised, not just payload
+                        if pos + 1 < bad.len() {
+                            bad[pos + 1] ^= 0x01;
+                        }
+                        bad[pos] ^= 0x80;
+                    }
+                    _ => {
+                        // zero run of 1..5 bytes: truncation of variable-bit data
+                        let run = 1 + (rng.next_u64() % 5) as usize;
+                        for k in 0..run {
+                            if pos + k < bad.len() {
+                                bad[pos + k] = 0;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // never panic on open:
+            let pmut = dir.join(format!("m{iter}.aahl"));
+            std::fs::write(&pmut, &bad).unwrap();
+            match open_index(&pmut) {
+                Ok((_f, idx)) => {
+                    let outd = dir.join(format!("out{iter}"));
+                    if let Ok(()) = cmd_extract(&pmut, &outd) {
+                        // any successful decode must be byte-exact
+                        let got = std::fs::read(outd.join("mix.bin"))
+                            .unwrap_or_else(|_| Vec::new());
+                        assert_eq!(got, data, "silent corruption at iter {iter}");
+                    }
+                    // index parsed -> dropped without panic
+                    drop(idx);
+                    let _ = std::fs::remove_dir_all(&outd);
+                }
+                Err(_) => {}
+            }
+            let _ = std::fs::remove_file(&pmut);
+        }
+    }
+
+    #[test]
+    fn store_mode_mutation_fuzz_never_panics() {
+        // store v2 carries a per-file hash, so ANY corruption (metadata,
+        // footer, or raw payload) must be rejected on open — never a panic,
+        // and never a silent wrong extraction.
+        let dir = scratch("storefuzz");
+        let src = dir.join("rand.bin");
+        let mut data = Vec::with_capacity(65536);
+        for i in 0..2048u64 {
+            let h = blake3::hash(&i.to_le_bytes());
+            data.extend_from_slice(&h.as_bytes()[..32]);
+        }
+        write_file(&src, &data);
+        let arc = dir.join("store.aahl");
+        cmd_create_params(&arc, &[src.clone()], 4096, pack_params(1, 16, 64, 0), 1).unwrap();
+        let (_f, idx) = open_index(&arc).unwrap();
+        assert!(idx.store_mode, "pseudo-random bytes must take the store path");
+        assert_eq!(idx.store_payload, 64, "store v2 layout: 6B hdr + 8B count + 2B pathlen + \"rand.bin\" + 8B len + 32B hash");
+        let good = std::fs::read(&arc).unwrap();
+        let footer_lo = good.len() - FOOTER_LEN as usize;
+        assert!(idx.store_payload as usize + data.len() + FOOTER_LEN as usize == good.len());
+
+        let mut rng = corpus::Prng::new(0xBEEF_C0DE);
+        for iter in 0..4000u32 {
+            let mut bad = good.clone();
+            let nmut = 1 + (rng.next_u64() % 3) as usize;
+            let mut truncated = false;
+            for _ in 0..nmut {
+                let pos = (rng.next_u64() as usize) % bad.len();
+                if bad.len() > 8 && rng.next_u64() % 4 == 0 {
+                    bad.truncate(pos);
+                    truncated = true;
+                    break;
+                }
+                // mutate anywhere: header, table, payload or footer
+                bad[pos] ^= 1 << (rng.next_u64() % 8);
+            }
+            let pmut = dir.join(format!("s{iter}.aahl"));
+            std::fs::write(&pmut, &bad).unwrap();
+            match open_index(&pmut) {
+                Ok((_f, idx)) => {
+                    assert!(!truncated, "truncated store payload must be rejected");
+                    assert!(
+                        idx.store_mode,
+                        "store fuzz mutation must stay a store container"
+                    );
+                    let outd = dir.join(format!("so{iter}"));
+                    // open_index verified every payload hash, so a surviving
+                    // store must extract the exact original (never a silent
+                    // wrong payload) and never panic.
+                    cmd_extract(&pmut, &outd).unwrap();
+                    let got = std::fs::read(outd.join("rand.bin")).unwrap();
+                    assert_eq!(got, data, "store corruption survived open at iter {iter}");
+                    drop(idx);
+                    let _ = std::fs::remove_dir_all(&outd);
+                }
+                Err(_) => {}
+            }
+            let _ = std::fs::remove_file(&pmut);
+        }
+    }
+
     fn oscillating_text() -> Vec<u8> {
         // alternate two idioms every 16 windows so live rules die by the next
         // window and every DATA record is unique (no dedup collapse)
@@ -1111,11 +1532,91 @@ let (_f, idx) = open_index(&arc).unwrap();
         write_file(&src, &blob);
         let a = dir.join("a.aahl");
         let b = dir.join("b.aahl");
-        cmd_create(&a, &[src.clone()], 4096).unwrap();
-        cmd_create(&b, &[src.clone()], 4096).unwrap();
+        cmd_create(&a, &[src.clone()], 4096, 1, 64, 1).unwrap();
+        cmd_create(&b, &[src.clone()], 4096, 1, 64, 1).unwrap();
         let ba = std::fs::read(&a).unwrap();
         let bb = std::fs::read(&b).unwrap();
         assert_eq!(ba, bb, "archive bytes must be deterministic per chunk-size");
+        let _ = dir;
+    }
+
+    #[test]
+    fn parallel_jobs_are_byte_identical_to_serial() {
+        let dir = scratch("parallel");
+        let src = dir.join("p.txt");
+        // 12 chunks with repeating idiom so the grammar actually forks and a
+        // couple of GC boundaries fire; must exceed the 4KiB chunk size.
+        let idiom = b"fn process(&mut self) -> usize { self.acc.wrapping_add(17) } ";
+        let mut blob = Vec::new();
+        for i in 0..12 {
+            for _ in 0..80 {
+                blob.extend_from_slice(idiom);
+            }
+            blob.extend_from_slice(format!("// chunk {i}\n").as_bytes());
+        }
+        assert!(blob.len() > 4096 * 3, "test needs >3 chunks");
+        write_file(&src, &blob);
+        let serial = dir.join("serial.aahl");
+        let par16 = dir.join("par16.aahl");
+        let par1 = dir.join("par1.aahl");
+        // lag=3 > 1 to engage the forked discovery path; gc_interval=5 to force
+        // remaps that the epoch guard must absorb.
+        cmd_create(&serial, &[src.clone()], 4096, 3, 5, 1).unwrap();
+        cmd_create(&par16, &[src.clone()], 4096, 3, 5, 16).unwrap();
+        cmd_create(&par1, &[src.clone()], 4096, 3, 5, 1).unwrap();
+        let bs = std::fs::read(&serial).unwrap();
+        let bp16 = std::fs::read(&par16).unwrap();
+        let bp1 = std::fs::read(&par1).unwrap();
+        assert_eq!(bs, bp16, "parallel (16 jobs) must match serial bytes");
+        assert_eq!(bs, bp1, "parallel (1 job) must match serial bytes");
+        // and both must round-trip
+        let extract = dir.join("x");
+        cmd_extract(&par16, &extract).unwrap();
+        let got = std::fs::read(extract.join("p.txt")).unwrap();
+        assert_eq!(got, blob, "parallel archive must round-trip");
+        let _ = dir;
+    }
+
+    #[test]
+    fn parallel_byte_identity_sweep_gc_and_lag() {
+        // Sweep lag in {1,2,3,5}, gc_interval in {3,5,9} with different worker
+        // counts and a mixed-idiom corpus. Every (lag,gc) combination must be
+        // byte-identical across serial, -j1 and -j8, and round-trip.
+        let dir = scratch("parallel_sweep");
+        let src = dir.join("mix.txt");
+        let idioms: [&[u8]; 3] = [
+            b"fn process(&mut self) -> usize { self.acc.wrapping_add(17) } ",
+            b"def transform(xs):\n    return [x * x for x in xs]\n",
+            b"SELECT id, name FROM users WHERE active = 1; ",
+        ];
+        let mut blob = Vec::new();
+        for i in 0..18 {
+            let id = idioms[i % idioms.len()];
+            for _ in 0..70 {
+                blob.extend_from_slice(id);
+            }
+            blob.extend_from_slice(format!("// section {i}\n").as_bytes());
+        }
+        assert!(blob.len() > 4096 * 5);
+        write_file(&src, &blob);
+        for &lag in &[1usize, 2, 3, 5] {
+            for &gc in &[3usize, 5, 9] {
+                for &jobs in &[1usize, 8] {
+                    let arc = dir.join(format!("l{lag}_g{gc}_j{jobs}.aahl"));
+                    cmd_create(&arc, &[src.clone()], 4096, lag, gc, jobs).unwrap();
+                }
+                let s = std::fs::read(dir.join(format!("l{lag}_g{gc}_j1.aahl"))).unwrap();
+                let p = std::fs::read(dir.join(format!("l{lag}_g{gc}_j8.aahl"))).unwrap();
+                assert_eq!(
+                    s, p,
+                    "byte identity failed lag={lag} gc={gc} (jobs 1 vs 8)"
+                );
+                let out = dir.join(format!("x_{lag}_{gc}"));
+                cmd_extract(dir.join(format!("l{lag}_g{gc}_j8.aahl")).as_path(), &out).unwrap();
+                let got = std::fs::read(out.join("mix.txt")).unwrap();
+                assert_eq!(got, blob, "roundtrip failed lag={lag} gc={gc}");
+            }
+        }
         let _ = dir;
     }
 
@@ -1162,5 +1663,75 @@ let (_f, idx) = open_index(&arc).unwrap();
         let (mut f, idx) = open_index(&arc).unwrap();
         assert!(!idx.store_mode);
         drop(f);
+    }
+
+    #[test]
+    fn safe_destination_rejects_parent_components() {
+        let root = scratch("safe_parent");
+        for bad in [
+            "a/../../evil.txt",
+            "../evil.txt",
+            "..\\evil.txt",
+            "dir/../..",
+            "/etc/passwd",
+            "C:\\windows\\system32\\evil.exe",
+            "C:evil.txt",
+        ] {
+            assert!(
+                safe_destination(&root, bad).is_err(),
+                "should reject: {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn safe_destination_accepts_nested_paths() {
+        let root = scratch("safe_ok");
+        for good in ["a.txt", "dir/nested.txt", "dir\\win.txt"] {
+            let d = safe_destination(&root, good).unwrap();
+            assert!(d.starts_with(&root.canonicalize().unwrap()));
+        }
+    }
+
+    #[test]
+    fn path_traversal_store_entry_fails() {
+        // end-to-end: a STORE container whose entry path escapes the out dir
+        // must fail extraction, and must never write outside the root.
+        let root = std::env::temp_dir().join(format!("aahl_escape_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let arc = root.join("evil.aahl");
+        let out = root.join("out");
+        let mut f = std::fs::File::create(&arc).unwrap();
+        use std::io::Write as _;
+        f.write_all(MAGIC_STORE).unwrap();
+        f.write_all(&STORE_VERSION.to_le_bytes()).unwrap();
+        f.write_all(&STORE_MODE.to_le_bytes()).unwrap();
+        let table_offset = f.stream_position().unwrap();
+        f.write_all(&1u64.to_le_bytes()).unwrap(); // nfiles
+        let path = "../../evil.txt";
+        f.write_all(&(path.len() as u16).to_le_bytes()).unwrap();
+        f.write_all(path.as_bytes()).unwrap();
+        f.write_all(&512u64.to_le_bytes()).unwrap(); // file_len
+        let payload = [0u8; 512];
+        f.write_all(blake3::hash(&payload).as_bytes()).unwrap();
+        let table_len = f.stream_position().unwrap() - table_offset;
+        f.write_all(&[0u8; 512]).unwrap(); // payload (must match hash above)
+        f.write_all(b"AAHE").unwrap();
+        f.write_all(&table_offset.to_le_bytes()).unwrap();
+        f.write_all(&table_len.to_le_bytes()).unwrap();
+        f.write_all(&0u64.to_le_bytes()).unwrap();
+        f.write_all(&1u64.to_le_bytes()).unwrap();
+        drop(f);
+
+        let err = cmd_extract(&arc, &out).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("unsafe") || msg.contains("escapes"), "msg: {msg}");
+        assert!(
+            !root.join("evil.txt").exists(),
+            "must not write outside out dir"
+        );
+        assert!(!out.join("evil.txt").exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -7,3 +7,4 @@ edition = "2021"
 clap = { version = "4", features = ["derive"] }
 blake3 = "1"
 anyhow = "1"
+rayon = "1"
