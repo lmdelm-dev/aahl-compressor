@@ -404,3 +404,207 @@ mod tests {
         }
     }
 }
+
+// =====================================================================
+// Phase A3: binary corpus harvest (real files from a source tree, default
+// C:\Windows\System32). Files are assigned to exactly one class by ordered
+// rules (installer-name/msi -> executable ext -> archive ext -> cold-image
+// ext), then each class list is taken in sorted order until its byte budget
+// is used up. A single file that would overshoot the budget is still taken
+// (no cherry-picking); the class then stops. Output: classed subdirs under
+// set_dir + manifest.tsv (class, rel, bytes, sha256) + summary.
+// Deterministic: collection is sorted before any filtering.
+// =====================================================================
+
+struct BinClass {
+    name: &'static str,
+    exts: &'static [&'static str],
+    name_pattern: Option<&'static str>,
+}
+
+const BIN_CLASSES: &[BinClass] = &[
+    BinClass {
+        name: "installer",
+        exts: &["msi"],
+        name_pattern: Some("setup|install|update"),
+    },
+    BinClass {
+        name: "executable",
+        exts: &["exe", "dll", "sys"],
+        name_pattern: None,
+    },
+    BinClass {
+        name: "archive",
+        exts: &["zip", "7z", "cab", "iso", "wim", "rar", "gz", "tar"],
+        name_pattern: None,
+    },
+    BinClass {
+        name: "cold-image",
+        exts: &["png", "jpg", "jpeg", "bmp", "gif", "ico", "ani", "cur"],
+        name_pattern: None,
+    },
+];
+
+const BIN_BUDGETS: &[u64] = &[8 << 20, 16 << 20, 16 << 20, 4 << 20]; // installer, executable, archive, cold-image
+
+fn bin_class_of(name: &str, ext: &str) -> Option<usize> {
+    for (i, c) in BIN_CLASSES.iter().enumerate() {
+        let name_hit = match c.name_pattern {
+            Some(rx) => rx.split('|').any(|part| name.to_ascii_lowercase().contains(part)),
+            None => false,
+        };
+        if name_hit || c.exts.contains(&ext) {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Read-only recursive scan that tolerates ACL-protected directories/files:
+/// unreadable entries are skipped and counted instead of aborting the harvest.
+fn scan_tolerant(dir: &Path, out: &mut Vec<PathBuf>, denied: &mut u64) {
+    for ent in match fs::read_dir(dir) {
+        Ok(it) => it,
+        Err(_) => {
+            *denied += 1;
+            return;
+        }
+    } {
+        match ent {
+            Ok(e) => {
+                let p = e.path();
+                match fs::metadata(&p) {
+                    Ok(m) if m.is_dir() => scan_tolerant(&p, out, denied),
+                    Ok(m) if m.is_file() && m.len() >= 1 => out.push(p),
+                    _ => {}
+                }
+            }
+            Err(_) => *denied += 1,
+        }
+    }
+}
+
+pub fn build_binary_corpus(set_dir: &Path, source: &Path, budgets: Option<&[u64]>) -> Result<()> {
+    if !source.is_dir() {
+        bail!("binary source dir does not exist: {}", source.display());
+    }
+    let mut files: Vec<PathBuf> = Vec::new();
+    let mut denied_entries = 0u64;
+    scan_tolerant(source, &mut files, &mut denied_entries);
+    files.sort();
+
+    // class lists of (rel, abs)
+    let mut cands: Vec<Vec<(String, PathBuf)>> = vec![Vec::new(); BIN_CLASSES.len()];
+    for p in &files {
+        let ext = p
+            .extension()
+            .map(|e| e.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        let name = p
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if name.is_empty() {
+            continue;
+        }
+        if let Some(ci) = bin_class_of(&name, &ext) {
+            if let Ok(rel) = p.strip_prefix(source) {
+                cands[ci].push((rel.to_string_lossy().replace('\\', "/"), p.clone()));
+            }
+        }
+    }
+
+    fs::create_dir_all(set_dir)?;
+    let mut manifest = String::from("class\trel\tbytes\tsha256\n");
+    let mut summary = String::from(
+        "class\tcandidates\tcand_bytes\tcopied\tcopied_bytes\tunreadable\text_breakdown\n",
+    );
+
+    for (ci, cls) in BIN_CLASSES.iter().enumerate() {
+        let budget = budgets.map(|b| b[ci]).unwrap_or(BIN_BUDGETS[ci]);
+        let cand_bytes: u64 = cands[ci]
+            .iter()
+            .map(|(_, p)| fs::metadata(p).map(|m| m.len()).unwrap_or(0))
+            .sum();
+        let mut ext_counts: std::collections::BTreeMap<String, u64> = Default::default();
+        let cls_dir = set_dir.join(cls.name);
+        fs::create_dir_all(&cls_dir)?;
+        let mut copied = 0u64;
+        let mut copied_bytes = 0u64;
+        let mut unreadable = 0u64;
+        let mut seen: std::collections::HashSet<String> = Default::default();
+        for (rel, p) in &cands[ci] {
+            let size = fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+            let ext = p
+                .extension()
+                .map(|e| e.to_string_lossy().to_ascii_lowercase())
+                .unwrap_or_default();
+            *ext_counts.entry(ext).or_insert(0) += 1;
+            // flat name; first occurrence wins (deterministic: cands sorted)
+            let fname = p
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if !seen.insert(fname.clone()) {
+                continue;
+            }
+            let dst = cls_dir.join(&fname);
+            let data = match fs::read(p) {
+                Ok(d) => d,
+                // ACL-protected System32 entries must not abort the harvest.
+                Err(_) => {
+                    unreadable += 1;
+                    continue;
+                }
+            };
+            if data.is_empty() || data.len() <= 12 {
+                // skip degenerate artifacts
+                continue;
+            }
+            write_file(&dst, &data)?;
+            let sum = {
+                use sha2::{Digest, Sha256};
+                let mut h = Sha256::new();
+                h.update(&data);
+                let d = h.finalize();
+                d.iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            };
+            manifest.push_str(&format!("{}\t{}\t{}\t{}\n", cls.name, rel, data.len(), sum));
+            copied += 1;
+            copied_bytes += data.len() as u64;
+            if copied_bytes >= budget {
+                break;
+            }
+        }
+        summary.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            cls.name,
+            cands[ci].len(),
+            cand_bytes,
+            copied,
+            copied_bytes,
+            unreadable,
+            ext_counts
+                .iter()
+                .map(|(k, v)| format!("{k}:{v}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+        eprintln!(
+            "corpus-bin: {} copied {copied} files / {copied_bytes} B of {cand} candidates / {cand_bytes} B",
+            cls.name, cand = cands[ci].len()
+        );
+    }
+
+    write_file(&set_dir.join("manifest.tsv"), manifest.as_bytes())?;
+    write_file(&set_dir.join("summary.txt"), summary.as_bytes())?;
+    println!(
+        "binary corpus built at {} from {} ({} entries skipped: ACL-protected/unreadable)",
+        set_dir.display(),
+        source.display(),
+        denied_entries
+    );
+    Ok(())
+}

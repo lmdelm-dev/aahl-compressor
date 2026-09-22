@@ -8,3 +8,4 @@ clap = { version = "4", features = ["derive"] }
 blake3 = "1"
 anyhow = "1"
 rayon = "1"
+sha2 = "0.10"

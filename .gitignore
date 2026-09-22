@@ -3,4 +3,6 @@
 /bench_results.tsv
 /work
 /t.log
-
+/corpus_bin
+/jobs-work
+/parstats-work

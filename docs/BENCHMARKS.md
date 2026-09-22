@@ -69,3 +69,136 @@ tiny/zstd                               1           14         12         13  14
   scope for the current codec.
 - **tiny**: AAHL 100.000 fixed overhead matches container minimums; zstd's
   14 is a stream header trick on a 1-byte input. Not a compression claim.
+
+
+---
+
+# Phase A (v5 milestone 1): parallelism, plumbing, and real binaries
+
+Measurement-only milestone. No compression-logic changes to the v4 codec were
+made; everything below records what the v4 encoder/decoder already does.
+
+Host: Windows 10 Pro 19045 x64, Intel i7-8750H (6c/12t) @ 2.2 GHz, 15.9 GB RAM,
+rustc 1.98.1. Tools: 7-Zip 26.02 (`7z`), xz 5.8.3, zstd 1.5.7, WinRAR 7.13
+(demo build, `rar`). AAHL v0.1.0 went through `cargo build --release` and the
+98-test suite (all green) before any measurement. Fixed reference settings:
+`zip6` = `7z a -tzip -mx=6`, `7z9` = `7z a -m0=LZMA2 -mx=9`, `xz` = `xz -9 -c`,
+`zstd` = `zstd -19 -c`, `rar` = `rar a -m5 -ep`. AAHL always `-j 1` in the bench
+lanes; chunk size 1 MiB, lag 16, GC every 64 chunks.
+
+Artifacts: `bench/jobs-scaling.tsv` (+ `jobs-scaling.raw.tsv`), `bench/parstats.tsv`,
+`bench/binary.tsv`, `bench/synthetic-matrix.tsv`, `bench/full-matrix.tsv`.
+
+## A1. Jobs scaling (`bench-jobs`): `--jobs N` buys nothing
+
+Per-run create/extract timing for `-j 1/4/8`, 5 runs, median times:
+
+| corpus     | jobs | med create | speedup vs j1 | efficiency | deterministic |
+|------------|------|-----------:|--------------:|-----------:|:-------------:|
+| text-large | 1    | 15 804 ms  | 1.000         | 1.000      | true          |
+| text-large | 4    | 15 755 ms  | 1.003         | 0.251      | true          |
+| text-large | 8    | 15 804 ms  | 1.000         | 0.125      | true          |
+| table      | 1    | 50 592 ms  | 1.000         | 1.000      | true          |
+| table      | 4    | 49 991 ms  | 1.012         | 0.253      | true          |
+| table      | 8    | 49 646 ms  | 1.019         | 0.127      | true          |
+| random     | 1    | 22 ms      | 1.000         | 1.000      | true          |
+| random     | 4    | 22 ms      | 1.000         | 0.250      | true          |
+| random     | 8    | 22 ms      | 1.000         | 0.125      | true          |
+
+`deterministic=true` means the full archive BLAKE3 is identical across
+`-j 1/4/8` for every corpus (also true of every create in the benchmark lanes).
+Speedup never exceeds 1.02; efficiency is 1/N by construction.
+
+## A2. Why: the parallelized phase is one microsecond of a 50-second job
+
+`create --par-stats` instruments the worker-pool path without touching codec
+semantics (counters live in the CLI wrapper):
+
+| corpus     | jobs | chunks | tasks | used | stale | discover_us | commit_us | peak_workers |
+|------------|------|-------:|------:|-----:|------:|------------:|----------:|-------------:|
+| table      | 4    | 9      | 9     | 8    | 1     | 8           | 49 744 162 | 1            |
+| table      | 8    | 9      | 9     | 8    | 1     | 3           | 49 557 003 | 1            |
+| text-large | 4    | 2      | 2     | 0    | 2     | 3           | 15 699 493 | 1            |
+| text-large | 8    | 2      | 2     | 0    | 2     | 3           | 15 810 173 | 1            |
+
+Reading:
+- **Worker reuse is not the problem.** On `table` 8 of 9 forked candidates were
+  committed (the 1 "stale" is the epoch-base bootstrap chunk). On `text-large`
+  both candidates are stale only because a 2-chunk input never bootstraps rules
+  inside the lag window, so each chunk is discovered against an empty grammar -
+  identical to serial in every respect (and byte-identical output).
+- **The parallel arm is ~1 µs; the serial arm is ~50 s.** `discover_us` is the
+  pooled work (captured-trie tokenization + BPE fold). `commit_us` is the
+  main-thread commit path (candidate rebind + order-1/blend arithmetic coding +
+  live model update + record write), which is serial by design because the
+  progressive model and the output archive are one deterministic sequence.
+- **`peak_workers=1`** confirms the pipeline never even overlaps: a worker
+  finishes its microsecond of discovery before the committer releases the next
+  chunk, so there is nothing to run in parallel with.
+- Net effect: `-j N` changes nothing observable except efficiency. The flag is
+  retained (it is harmless, byte-identical, and exercised by the test suite),
+  but parallel discovery cannot speed up v4 create. Improving create time
+  requires attacking the serial commit path - out of scope for a measurement
+  milestone.
+
+## A3. Real binary corpus (`corpus-bin`, harvest from C:\Windows\System32)
+
+Deterministic harvest (sorted order, no reordering of results by favour):
+files are classed by ordered rules - installer (setup/install/update-named or
+.msi) -> executable (.exe/.dll/.sys) -> archive (.zip/.7z/.cab/.iso/.wim/.rar
+/.tar) -> cold-image (.png/.jpg/.bmp/.gif/.ico). Each class is filled in sorted
+order to a byte budget (8/16/16/4 MiB); one overshooting file per class is
+kept. ACL-protected entries (15) are skipped and counted. Output tree is
+`corpus_bin/<class>/` + `manifest.tsv` (class, rel, bytes, sha256) + summary.
+
+| class      | files | copied bytes | ext mix |
+|------------|------:|-------------:|---------|
+| installer  | 58    | 9 534 133    | update/setup-named .cat/.dll/.exe/.mui/.png |
+| executable | 42    | 16 779 568   | 38 .dll, 4 .exe |
+| archive    | 11    | 16 799 516   | 9 .cab, 1 .wim, 1 .zip |
+| cold-image | 94    | 4 496 311    | 88 .png, 3 .jpg, 3 .gif |
+| **total**  | 205   | 47 609 528   | (manifest hashes verified by re-read) |
+
+Single-lane median ratios (full rows in `bench/binary.tsv`):
+
+| corpus    | aahl | 7z9  | xz   | zstd | rar  | zip6 |
+|-----------|-----:|-----:|-----:|-----:|-----:|-----:|
+| executable| 0.495| 0.245| 0.315| 0.339| 0.327| 0.391|
+| installer | 0.517| 0.367| 0.425| 0.434| 0.432| 0.450|
+| archive   | 0.995| 0.786| 0.789| 0.789| 0.790| 0.879|
+| cold-image| 0.979| 0.957| 0.963| 0.962| 0.965| 0.969|
+
+Reading (honest):
+- **AAHL is strong on text, weak on real binaries.** On 42 real System32
+  binaries it reaches only 0.495 vs 0.245 for 7z/LZMA2 and 0.315 for xz. The
+  phrase-level grammar cannot discover the byte-windowed match structure of
+  machine code that LZMA-family coders exploit; this is a real, documented
+  limitation, not a tuning gap. Create also costs 166 s on binaries vs 2-4 s
+  for the references.
+- **Precompressed/cold inputs are stored, not worsened.** Archives (.cab/.wim,
+  already-compressed) stay at 0.995 and PNGs at 0.979, both at or near the
+  reference lanes - the per-file STORE fallback works as designed and never
+  inflates beyond ~0.1% (worst observed overflow: precompressed/zip6 0.500 is
+  7z re-compressing a 2 MB store with a 1 MB dictionary; AAHL stays 1.0001).
+- Nothing in this milestone changes or improves these numbers; they are the v4
+  baseline to measure Phase B/C proposals against.
+
+## A4. Full matrix
+
+`bench/full-matrix.tsv` = 60 rows (36 synthetic + 24 binary) across 6 lanes
+and 10 corpora, every row `ok=true` (round-trip verified). Headline v4
+positioning, one line per corpus class:
+
+| corpus (raw bytes)        | best lane | best ratio | aahl | aahl rank |
+|---------------------------|-----------|-----------:|-----:|:---------:|
+| text-large (1.4 MB prose) | aahl      | 0.2362     | 0.2362 | 1/6      |
+| table (9.1 MB CSV/JSON)   | 7z9       | 0.1526     | 0.1834 | 5/6      |
+| executable (16.8 MB DLLs) | 7z9       | 0.2453     | 0.4950 | 6/6      |
+| installer (9.5 MB)        | 7z9       | 0.3669     | 0.5172 | 6/6      |
+| archive (16.8 MB)         | 7z9       | 0.7864     | 0.9950 | 6/6      |
+| cold-image (4.5 MB PNGs)  | zstd      | 0.9618     | 0.9792 | 6/6      |
+| random / precompressed    | any       | ~1.000     | ~1.000 | tie      |
+
+The v4 codec wins text, ties store-lanes, and loses - clearly and predictably -
+on machine code and compressed data. That is the measurement Phase A was
+commissioned to establish.

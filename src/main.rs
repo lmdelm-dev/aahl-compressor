@@ -10,9 +10,11 @@ mod spectral;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use std::collections::HashMap;
+use std::fs;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Take, Write};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 const MAGIC_HDR: &[u8; 4] = b"AAHL";
 const MAGIC_FTR: &[u8; 4] = b"AAHE";
@@ -68,6 +70,12 @@ enum Cmd {
         /// commits stay serial, so any -j produces byte-identical archives.
         #[arg(long, short, default_value_t = 1)]
         jobs: usize,
+        /// Diagnostics (measurement-gate only): write parallel-encoder counters
+        /// (tasks spawned, used/stale discovery, falls-back, time split, peak
+        /// workers) to FILE. Requires -j > 1 to be meaningful; archive bytes are
+        /// unchanged and determinism is unaffected. Off by default.
+        #[arg(long, value_name = "FILE")]
+        par_stats: Option<PathBuf>,
     },
     /// List contents
     List {
@@ -103,6 +111,44 @@ enum Cmd {
         tsv: PathBuf,
         #[arg(long, default_value_t = 1_048_576, help = "chunk size in bytes for the aahl lane")]
         chunk_size: usize,
+    },
+    /// Phase A1: AAHL-only jobs-scaling benchmark (create/extract per -j N)
+    #[command(name = "bench-jobs")]
+    RunBenchJobs {
+        set_dir: PathBuf,
+        #[arg(long, default_value = "bench/jobs-scaling.tsv", help = "summary TSV (median/min/max, speedup, efficiency)")]
+        tsv: PathBuf,
+        #[arg(long, default_value = "bench/jobs-scaling.raw.tsv", help = "per-run raw TSV")]
+        raw_tsv: PathBuf,
+        #[arg(long, default_value_t = 1_048_576, help = "chunk size in bytes")]
+        chunk_size: usize,
+        #[arg(long, default_value_t = 5, help = "timing repetitions per (corpus, jobs)")]
+        runs: usize,
+        #[arg(long, value_delimiter = ',', default_value = "1,4,8", help = "jobs values to measure")]
+        jobs: Vec<usize>,
+        #[arg(long, value_delimiter = ',', help = "corpus names to include (default: all)")]
+        corpora: Vec<String>,
+    },
+    /// Phase A3: harvest a labelled binary corpus (System32) + SHA-256 manifest
+    #[command(name = "corpus-bin")]
+    BuildBinaryCorpus {
+        #[arg(default_value = "corpus_bin", help = "output dir with classed subdirs")]
+        set_dir: PathBuf,
+        #[arg(long = "source", default_value = "C:\\Windows\\System32", help = "tree to harvest from")]
+        source: PathBuf,
+    },
+    /// Phase A2: collect parallel-encoder internals via create --par-stats
+    #[command(name = "bench-parstats")]
+    RunBenchParstats {
+        set_dir: PathBuf,
+        #[arg(long, default_value = "bench/parstats.tsv", help = "write counters to this TSV")]
+        tsv: PathBuf,
+        #[arg(long, default_value_t = 1_048_576, help = "chunk size in bytes")]
+        chunk_size: usize,
+        #[arg(long, value_delimiter = ',', default_value = "4,8", help = "jobs values to instrument (j>1)")]
+        jobs: Vec<usize>,
+        #[arg(long, value_delimiter = ',', help = "corpus names to include (default: all)")]
+        corpora: Vec<String>,
     },
     /// Ablation study: per-corpus payload per chunk size per pipeline mode
     #[command(name = "ablate")]
@@ -242,6 +288,7 @@ fn visit_dir(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) -> Resul
     Ok(())
 }
 
+#[allow(dead_code)] // test seam (host CLI uses cmd_create_par)
 fn cmd_create(
     archive: &Path,
     inputs: &[PathBuf],
@@ -250,23 +297,51 @@ fn cmd_create(
     gc_interval: usize,
     jobs: usize,
 ) -> Result<()> {
+    cmd_create_par(archive, inputs, chunk_size, lag, gc_interval, jobs, None)
+}
+
+/// CLI create entry: validation plus optional Phase A2 parallel diagnostics.
+fn cmd_create_par(
+    archive: &Path,
+    inputs: &[PathBuf],
+    chunk_size: u32,
+    lag: usize,
+    gc_interval: usize,
+    jobs: usize,
+    par_stats: Option<&Path>,
+) -> Result<()> {
     if !(1..=1024).contains(&lag) {
         bail!("lag must be 1..1024");
     }
     if !(1..=4096).contains(&gc_interval) {
         bail!("gc-interval must be 1..4096");
     }
-    cmd_create_params(
+    let mut stats = ParStats::default();
+    let res = cmd_create_params_version_impl(
         archive,
         inputs,
         chunk_size,
         pack_params(lag as u64, gc_interval as u64, PARAM_RULES_DEFAULT, 0),
         jobs,
-    )
+        VERSION,
+        if par_stats.is_some() { Some(&mut stats) } else { None },
+    );
+    if let Some(p) = par_stats {
+        if jobs <= 1 {
+            let _ = std::fs::write(
+                p,
+                "par_tasks\t0\npar_used\t0\npar_stale\t0\npar_fallback\t0\npar_discover_us\t0\npar_commit_us\t0\npar_wait_us\t0\npar_peak_workers\t0\nnote\tserial: --par-stats needs -j > 1\n",
+            );
+        } else if let Err(e) = write_par_stats(p, &stats) {
+            eprintln!("par-stats write failed: {e:#}");
+        }
+    }
+    res
 }
 
 /// Full create path with explicit params (tests inject a short GC interval to
 /// force grammar reclamation deterministically; the CLI uses defaults).
+#[allow(dead_code)] // test seam (host CLI uses cmd_create_par)
 fn cmd_create_params(
     archive: &Path,
     inputs: &[PathBuf],
@@ -280,6 +355,7 @@ fn cmd_create_params(
 /// Full create path with an explicit container version. Production writes
 /// VERSION (4: exact-context hot-rule model); tests use this seam to build
 /// legacy v3 archives through the same emit machinery.
+#[allow(dead_code)] // test seam (host CLI uses cmd_create_par)
 fn cmd_create_params_version(
     archive: &Path,
     inputs: &[PathBuf],
@@ -287,6 +363,21 @@ fn cmd_create_params_version(
     params: u64,
     jobs: usize,
     version: u16,
+) -> Result<()> {
+    cmd_create_params_version_impl(archive, inputs, chunk_size, params, jobs, version, None)
+}
+
+/// Full create path with explicit params and an optional Phase A2 diagnostics
+/// sink (measurement-only; it never changes output bytes or determinism).
+#[allow(clippy::too_many_arguments)]
+fn cmd_create_params_version_impl(
+    archive: &Path,
+    inputs: &[PathBuf],
+    chunk_size: u32,
+    params: u64,
+    jobs: usize,
+    version: u16,
+    par_stats: Option<&mut ParStats>,
 ) -> Result<()> {
     if !(4096..=1_048_576).contains(&chunk_size) {
         bail!("chunk-size must be 4KiB..1MiB (fold is O(n*m), keep small)");
@@ -360,7 +451,7 @@ fn cmd_create_params_version(
     // bounded pipeline runs pure discovery ahead of a strictly serial commit,
     // which keeps the archive byte-identical for any worker count.
     let chunks = if jobs > 1 && lag > 1 {
-        emit_parallel(&mut out, &pieces, &mut grammar, jobs)?
+        emit_parallel(&mut out, &pieces, &mut grammar, jobs, par_stats)?
     } else {
         emit_serial(&mut out, &pieces, &mut grammar)?
     };
@@ -436,6 +527,32 @@ struct Gather {
     entries: Vec<FileEntry>,
 }
 
+/// Measurement-only counters for the parallel encoder (Phase A2). Gathered
+/// behind `create --par-stats FILE`; when unset the parallel path runs exactly
+/// as before (no counters, no extra allocations beyond two toy atomics per
+/// run). Counters never influence output bytes or determinism: discovery stays
+/// pure and commit stays serial.
+#[derive(Default, Clone)]
+pub struct ParStats {
+    pub tasks: u64,        // worker tasks spawned (pool.spawn count)
+    pub used: u64,         // worker candidate consumed (snapshot matched at commit)
+    pub stale: u64,        // worker candidate discarded (snapshot drift -> serial re-discovery)
+    pub fallback: u64,     // commit had no worker result at all (serial compress)
+    pub discover_us: u64,  // aggregate worker time inside fork_candidate (microseconds)
+    pub commit_us: u64,    // main-thread commit work (compress_parallel + record write)
+    pub wait_us: u64,      // main thread blocked waiting for worker results (microseconds)
+    pub peak_workers: u64, // high-water mark of concurrently running workers
+}
+
+fn write_par_stats(path: &Path, s: &ParStats) -> Result<()> {
+    let txt = format!(
+        "par_tasks\t{}\npar_used\t{}\npar_stale\t{}\npar_fallback\t{}\npar_discover_us\t{}\npar_commit_us\t{}\npar_wait_us\t{}\npar_peak_workers\t{}\n",
+        s.tasks, s.used, s.stale, s.fallback, s.discover_us, s.commit_us, s.wait_us, s.peak_workers
+    );
+    fs::write(path, txt).with_context(|| format!("write par-stats {}", path.display()))?;
+    Ok(())
+}
+
 fn emit_serial(
     out: &mut File,
     pieces: &[Piece],
@@ -479,7 +596,9 @@ fn emit_parallel(
     pieces: &[Piece],
     grammar: &mut grammar::PersistentGrammar,
     jobs: usize,
+    stats: Option<&mut ParStats>,
 ) -> Result<Vec<ChunkMeta>> {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
     use std::sync::mpsc;
     let n = pieces.len();
     let lag = grammar.lag();
@@ -489,7 +608,20 @@ fn emit_parallel(
         .build()
         .unwrap();
 
+    // Phase A2 instrumentation state (two toy atomics; parsed only when the
+    // caller asked for diagnostics). Never changes what gets written.
+    let active = std::sync::Arc::new(AtomicUsize::new(0));
+    let peak = std::sync::Arc::new(AtomicUsize::new(0));
+    let discover_us = std::sync::Arc::new(AtomicU64::new(0));
+    let stats_on = stats.is_some();
+
     let mut chunks: Vec<ChunkMeta> = Vec::with_capacity(n);
+    let mut s_tasks: u64 = 0;
+    let mut s_used: u64 = 0;
+    let mut s_stale: u64 = 0;
+    let mut s_fallback: u64 = 0;
+    let mut s_commit_us: u64 = 0;
+    let mut s_wait_us: u64 = 0;
     // (snapshot_len, gc_epoch, candidate) per chunk, available once the chunk
     // becomes the head of the commit queue.
     let mut results: Vec<Option<mpsc::Receiver<(usize, u64, Option<grammar::ForkCandidate>)>>> =
@@ -515,25 +647,61 @@ fn emit_parallel(
             let raw = pieces[r].raw.clone();
             let cfg = cfg;
             let (tx, rx) = mpsc::channel();
+            let active = std::sync::Arc::clone(&active);
+            let peak = std::sync::Arc::clone(&peak);
+            let discover_us = std::sync::Arc::clone(&discover_us);
             pool.spawn(move || {
+                let cur = active.fetch_add(1, Relaxed) + 1;
+                let _ = peak.fetch_max(cur, Relaxed);
+                let t0 = Instant::now();
                 let cand = grammar::fork_candidate(&prefix, &cfg, &raw, prefix.len());
+                let _ = discover_us.fetch_add(t0.elapsed().as_micros() as u64, Relaxed);
+                active.fetch_sub(1, Relaxed);
                 let _ = tx.send((snap, epoch, cand));
             });
             results[r] = Some(rx);
             dispatch_tail += 1;
+            s_tasks += 1;
         }
 
         // Commit the head chunk, reusing its worker's candidate when the live
         // snapshot still matches; otherwise re-discover serially (identical
         // bytes, since discovery is a pure function of snapshot + raw).
+        let t_wait = Instant::now();
         let (packed, pending_gc) = match &results[committed] {
             Some(rx) => {
                 let (snap, epoch, cand) = rx
                     .recv()
                     .map_err(|_| anyhow::anyhow!("discovery worker failed"))?;
-                grammar.compress_parallel(cand, snap, epoch, &pieces[committed].raw)
+                if stats_on {
+                    s_wait_us += t_wait.elapsed().as_micros() as u64;
+                }
+                let t_commit = Instant::now();
+                // Replicates compress_parallel's own freshness check so the
+                // harness can classify used-vs-stale without touching the codec.
+                let valid = grammar.snapshot_len_for(committed) == snap
+                    && snap < grammar.rules_len()
+                    && grammar.gc_epoch() == epoch;
+                let r = grammar.compress_parallel(cand, snap, epoch, &pieces[committed].raw);
+                if stats_on {
+                    s_commit_us += t_commit.elapsed().as_micros() as u64;
+                    if valid {
+                        s_used += 1;
+                    } else {
+                        s_stale += 1;
+                    }
+                }
+                r
             }
-            None => grammar.compress(&pieces[committed].raw),
+            None => {
+                let t_commit = Instant::now();
+                let r = grammar.compress(&pieces[committed].raw);
+                if stats_on {
+                    s_commit_us += t_commit.elapsed().as_micros() as u64;
+                    s_fallback += 1;
+                }
+                r
+            }
         };
         out.write_all(&[RECORD_DATA])?;
         let body_len = 32u32 + 4 + packed.len() as u32;
@@ -553,6 +721,16 @@ fn emit_parallel(
         });
         results[committed] = None;
         committed += 1;
+    }
+    if let Some(st) = stats {
+        st.tasks = s_tasks;
+        st.used = s_used;
+        st.stale = s_stale;
+        st.fallback = s_fallback;
+        st.discover_us = discover_us.load(Relaxed);
+        st.commit_us = s_commit_us;
+        st.wait_us = s_wait_us;
+        st.peak_workers = peak.load(Relaxed) as u64;
     }
     Ok(chunks)
 }
@@ -1074,7 +1252,16 @@ fn main() -> Result<()> {
             lag,
             gc_interval,
             jobs,
-        } => cmd_create(&archive, &inputs, chunk_size, lag, gc_interval, jobs),
+            par_stats,
+        } => cmd_create_par(
+            &archive,
+            &inputs,
+            chunk_size,
+            lag,
+            gc_interval,
+            jobs,
+            par_stats.as_deref(),
+        ),
         Cmd::List { archive } => cmd_list(&archive),
         Cmd::Extract { archive, out_dir } => cmd_extract(&archive, &out_dir),
         Cmd::BlockSize { input, sweep } => {
@@ -1116,8 +1303,34 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::BuildCorpus { set_dir, source } => corpus::build_corpus(&set_dir, source.as_deref()),
+        Cmd::BuildBinaryCorpus { set_dir, source } => {
+            corpus::build_binary_corpus(&set_dir, &source, None)?;
+            Ok(())
+        }
         Cmd::RunBench { set_dir, tsv, chunk_size } => {
             bench::run_bench(&set_dir, &tsv, chunk_size)?;
+            Ok(())
+        }
+        Cmd::RunBenchJobs {
+            set_dir,
+            tsv,
+            raw_tsv,
+            chunk_size,
+            runs,
+            jobs,
+            corpora,
+        } => {
+            bench::run_jobs_bench(&set_dir, &tsv, &raw_tsv, chunk_size, runs, &jobs, &corpora)?;
+            Ok(())
+        }
+        Cmd::RunBenchParstats {
+            set_dir,
+            tsv,
+            chunk_size,
+            jobs,
+            corpora,
+        } => {
+            bench::run_parstats(&set_dir, &tsv, chunk_size, &jobs, &corpora)?;
             Ok(())
         }
         Cmd::RunAblate { set_dir, tsv, chunk_sizes } => {
