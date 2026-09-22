@@ -55,8 +55,8 @@ aahl blocksize <INPUT> [--sweep]
   bytes, empty/tiny, precompressed). With `--source DIR` it also copies real
   `.rs`/`.exe`/`.dll`/installer files from a source tree.
 - `bench` compresses every corpus set with AAHL and (when installed) `zip6`
-  (7-Zip deflate -mx=6), `7z9` (LZMA2 -mx=9), `xz -9`, and `zstd -19`, and
-  writes a TSV of sizes and create/extract times.
+  (7-Zip deflate -mx=6), `7z9` (LZMA2 -mx=9), `xz -9`, `zstd -19`, and
+  `rar` (WinRAR -m5), and writes a TSV of sizes and create/extract times.
 
 ## Format
 
