@@ -145,6 +145,11 @@ per chunk. `decompress_block` dispatches on the leading tag byte.
   to reason about); any `-j` shrinks create time on large inputs with provably
   identical bytes.
 
+- `RULE_CTX` (8 rule-context buckets in the token model): ablation sweep
+  (docs/ABLATION.md) showed 16 buckets win only at the 4096 chunk size and
+  lose at 262144; RULE_CTX is a format-level constant, so changing it would
+  break v3 read-compat for existing archives. Kept at 8.
+
 ## 9. Bench methodology
 
 `bench` compresses each corpus set five ways when reference tools exist —

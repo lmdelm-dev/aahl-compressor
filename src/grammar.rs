@@ -100,6 +100,21 @@ impl PhraseTrie {
 
     /// Longest prefix of `bytes` that is a rule expansion. Returns
     /// `(rule, consumed)`; consumed == 0 means no match.
+    /// Approximate heap bytes held by the trie (kids maps + node overhead).
+    fn errata_bytes(&self) -> usize {
+        const NODE_FIXED: usize = 32; // Option<u16> + HashMap header slop
+        let mut stack: Vec<&TNode> = vec![&self.root];
+        let mut total = NODE_FIXED;
+        while let Some(n) = stack.pop() {
+            total += n.kids.len() * 32; // HashMap<K,V> slot cost (approx)
+            for (_, kid) in &n.kids {
+                total += NODE_FIXED;
+                stack.push(kid);
+            }
+        }
+        total
+    }
+
     fn longest(&self, bytes: &[u8]) -> (Option<u16>, usize) {
         let mut cur = &self.root;
         let mut best: Option<(u16, usize)> = None;
@@ -599,6 +614,23 @@ impl PersistentGrammar {
 
     /// Decode `blk`. Non-'G' blocks are dispatched to the stateless decoder and
     /// never touch the grammar; 'G' blocks advance it.
+    /// Peak heap footprint of the persistent model + rule tables (bytes).
+    /// Used by the ablation harness to report the memory cost of the
+    /// cross-chunk grammar for a given chunk size.
+    pub fn model_footprint_bytes(&self) -> usize {
+        // counts: TOKEN_NC rows x n columns x u64; fenwicks pinned at MAX_SYMS
+        let nc = self.model.n_contexts();
+        let n = self.model.n();
+        let counts = nc * n * 8;
+        let fenwicks = nc * (4096 + 1) * 8; // Fenwick tree len = n+1, pinned
+        let totals = nc * 8;
+        let rules = self.rules.len() * 4;
+        let pair_index = self.pair_index.len() * 24;
+        let trie = self.trie.errata_bytes();
+        let last_use = self.last_use.len() * 8;
+        counts + fenwicks + totals + rules + pair_index + trie + last_use
+    }
+
     pub fn decompress(&mut self, blk: &[u8], expected_len: usize) -> Result<Vec<u8>> {
         if !(blk.len() >= 2 && blk[0] == G_TAG.0 && blk[1] == G_TAG.1) {
             return crate::aahl::decompress_block(blk, expected_len);

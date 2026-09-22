@@ -82,7 +82,11 @@ impl<'a> Decoder<'a> {
     pub fn threshold(&mut self, total: u64) -> u64 {
         self.range /= total;
         if self.range == 0 {
-            // pathological overshoot; keep code in range via clamp
+            // pathological overshoot: a corrupt bitstream divided range down to
+            // zero. Clamp to 1 so a subsequent decode_step cannot leave the
+            // renorm loop stuck on 0 <<= 8 == 0. Clamping only fires on
+            // corrupt input; valid streams keep their exact code path.
+            self.range = 1;
             0
         } else {
             self.code / self.range
@@ -91,10 +95,18 @@ impl<'a> Decoder<'a> {
 
     pub fn decode_step(&mut self, start: u64, size: u64, _total: u64) {
         self.code -= start * self.range;
-        self.range *= size;
-        while self.range < TOP {
+        self.range = self.range.saturating_mul(size);
+        if self.range == 0 {
+            // corrupt input wrapped range to zero; renormalisation below would
+            // stall on 0 <<= 8. Clamp so the loop terminates.
+            self.range = 1;
+        }
+        let max_shifts = 8; // TOP = 1<<24; 1 << 8*3 already reaches it
+        let mut shifts = 0;
+        while self.range < TOP && shifts < max_shifts {
             self.range <<= 8;
             self.code = ((self.code << 8) | self.read_byte()) & 0xFFFF_FFFF;
+            shifts += 1;
         }
     }
 
@@ -407,6 +419,12 @@ impl PersistentTokenModel {
         }
         let total = vec![n0 as u64; nc];
         Self { n: n0, base_n: n0, counts, fw, total, ctx: TOKEN_SENTINEL, log: Vec::new(), start_ctx: TOKEN_SENTINEL }
+    }
+
+    /// Number of adaptive contexts in the persistent model (literals + rule
+    /// buckets + sentinel). Exposed for the ablation harness footprint math.
+    pub fn n_contexts(&self) -> usize {
+        self.counts.len()
     }
 
     /// Alphabet size this model currently allocates counts for.
@@ -879,6 +897,23 @@ mod tests {
         assert!(decode_tokens(&[0, 0, 0], 5000, 1, &mut vec![]).is_err());
     }
 
+    #[test]
+    fn corrupt_overshoot_threshold_never_stalls_renorm() {
+        // A corrupt bitstream can drive `range / total` to 0 inside
+        // Decoder::threshold(). The decoder must not leave range==0 behind:
+        // the following decode_step would then keep `range *= size` at 0 and
+        // the renorm loop (`while range < TOP { range <<= 8; }`) would stall
+        // forever on 0 <<= 8 == 0. Clamp range to >= 1 so renorm terminates.
+        let buf = vec![0u8; 8];
+        let mut dec = Decoder::new(&buf);
+        let th = dec.threshold(u64::MAX); // range / huge total -> 0
+        assert_eq!(th, 0, "overshoot must surface a zero threshold");
+        assert!(dec.range >= 1, "range left at {} after overshoot", dec.range);
+        // decode_step with any nonzero size must terminate the renorm loop
+        dec.decode_step(1, 2, u64::MAX);
+        assert!(dec.range >= TOP, "range never renormalised: {}", dec.range);
+        assert!(dec.consumed() > 0, "decoder must have consumed input");
+    }
     fn o1_roundtrip(raw: &[u8]) {
         let mut out = Vec::new();
         let buf = encode_bytes_order1(raw);
@@ -954,6 +989,32 @@ mod tests {
         assert!(o1 < o0, "expected o1 token ({}) < o0 ({})", o1, o0);
     }
 
+    #[test]
+    fn rule_ctx_stays_in_bucket_range() {
+        let n = MAX_SYMS;
+        for sym in 256..MAX_SYMS {
+            let c = rule_ctx(sym, n);
+            assert!(c >= 256, "rule {sym} ctx {c} below literal range");
+            assert!(c < TOKEN_NC, "rule {sym} ctx {c} past TOKEN_NC {TOKEN_NC}");
+        }
+    }
+
+    #[test]
+    fn rule_ctx_permutes_all_buckets_for_dense_rules() {
+        let n = MAX_SYMS;
+        let mut seen = std::collections::HashSet::new();
+        for sym in 256..(256 + RULE_CTX) {
+            seen.insert(rule_ctx(sym, n));
+        }
+        assert_eq!(seen.len(), RULE_CTX, "expected all {RULE_CTX} buckets used");
+    }
+
+    #[test]
+    fn rule_ctx_uses_rule_id_not_alphabet_size() {
+        let a = rule_ctx(300, 301);
+        let b = rule_ctx(300, MAX_SYMS);
+        assert_eq!(a, b, "rule context must not depend on alphabet size");
+    }
     #[test]
     fn o1_token_shares_bucketed_rule_contexts() {
         // rule symbols rotate through buckets deterministically, must roundtrip

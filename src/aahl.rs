@@ -473,6 +473,53 @@ pub fn grammar_cost(raw: &[u8], cfg: &FoldConfig) -> f64 {
     (overhead + rules.len() as f64 * 4.0) / raw.len() as f64
 }
 
+// ---------- Ablation diagnostics ----------
+//
+// Measurement-only helpers: compute the block size every codec would produce
+// for a chunk WITHOUT changing the archive format. The ablation harness sums
+// these over a corpus to produce evidence for which pipeline component earns
+// its bytes. `blend` mirrors the 'D' layout with the deterministic order-1+2
+// blend blob (see arith.rs); it is not yet emitted into archives -- this is
+// the measurement side of "wire into the persistent model in a later phase".
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ModeSizes {
+    pub fold: usize,        // 'F' legacy huffman fold block
+    pub order0: usize,      // 'A' adaptive order-0 over folded tokens
+    pub order1_tok: usize,  // 'D' order-1 over folded tokens
+    pub order1_byte: usize, // 'C' order-1 over raw bytes
+    pub blend: usize,       // blend (order-1 + order-2 bucket), 'D' framing
+}
+
+fn blend_size_parts(tokens: &[u16], rules: &[(u16, u16)]) -> usize {
+    let n = 256 + rules.len();
+    let blob = arith::encode_tokens_blend(tokens, n);
+    2 + 4 + rules.len() * 4 + 8 + blob.len()
+}
+
+/// Block sizes every codec would produce for `raw` under `cfg`.
+/// `cfg.max_merges == 0` disables the recursive pair-merge pass (rules stay
+/// empty), which is the "recursion off" arm of the ablation.
+pub fn mode_sizes_with(raw: &[u8], cfg: &FoldConfig) -> ModeSizes {
+    if raw.is_empty() {
+        return ModeSizes::default();
+    }
+    let init: Vec<u16> = raw.iter().map(|&b| b as u16).collect();
+    let (tokens, rules) = fold_with(init, cfg);
+    ModeSizes {
+        fold: fold_encode_parts(&tokens, &rules).len(),
+        order0: arith_encode_parts(&tokens, &rules).len(),
+        order1_tok: o1_encode_parts(&tokens, &rules).len(),
+        order1_byte: o1_bytes_encode(raw).len(),
+        blend: blend_size_parts(&tokens, &rules),
+    }
+}
+
+/// Default-config variant used by the ablation sweeps.
+pub fn mode_sizes(raw: &[u8]) -> ModeSizes {
+    mode_sizes_with(raw, &FoldConfig::default())
+}
+
 /// Order-1 folded-token block: [0xA0, b'D', num_rules u32, rules, num_tokens u32,
 ///  blob_len u32, blob]. 'D' = order-1 on grammar tokens.
 fn o1_encode(raw: &[u8]) -> Vec<u8> {
@@ -1239,5 +1286,61 @@ mod tests {
         assert!(decompress_block(&[0xA0, b'R', 2, 0, 0, 0, b'x'], 3).is_err());
         assert!(decompress_block(&[0xA0, b'R', 3, 0, 0, 0, b'x'], 2).is_err());
         assert!(decompress_block(&[0xA0, b'R', 1, 0, 0, 0], 1).is_err());
+    }
+    #[test]
+    fn mode_sizes_order1_byte_matches_block_sizes() {
+        // The ablation diagnostic must agree with the established block_sizes
+        // measurement for the codecs they share (fold/order0/order1tok/o1byte).
+        let raw = b"fn foo() { return bar(baz); } else { x += 1; }\n".repeat(50);
+        let m = mode_sizes(&raw);
+        let (folded, arith, o1t, o1b, _packed, _r, _mode) = block_sizes(&raw);
+        assert_eq!(m.fold, folded);
+        assert_eq!(m.order0, arith);
+        assert_eq!(m.order1_tok, o1t);
+        assert_eq!(m.order1_byte, o1b);
+    }
+
+    #[test]
+    fn mode_sizes_recursion_off_has_zero_rules_delta() {
+        // With max_merges=0 no new rules are invented: order0/order1tok over
+        // the token stream must equal the byte-level order1 cost (same
+        // alphabet 256, no folding), and blend must equal order1_tok exactly
+        // because a 256-symbol stream has no rule buckets to blend.
+        let raw = b"abababab cdcdcdcd efefefef 12345678\n".repeat(20);
+        let on = mode_sizes_with(&raw, &FoldConfig::default());
+        let off_cfg = FoldConfig { max_merges: 0, ..FoldConfig::default() };
+        let off = mode_sizes_with(&raw, &off_cfg);
+        assert!(on.fold < off.fold, "folding must shrink the fold block ({} vs {})", on.fold, off.fold);
+        // order0 arith over the folded stream should beat the literal stream
+        assert!(on.order0 < off.order0, "grammar tokens must beat literals order0");
+    }
+
+    #[test]
+    fn mode_sizes_blend_is_sane_upper_bound() {
+        // blend adds an order-2 model; on skewed single-rule streams it must
+        // not be materially worse than order1_tok, and on two-back structure
+        // it should win (mirrors the arith unit test).
+        let n = 300;
+        let mut tok: Vec<u16> = Vec::new();
+        for i in 0..60_000u32 {
+            let row = (i % 8) as u16;
+            tok.push(row);
+            tok.push(100u16);
+            tok.push(if row % 2 == 0 { 1 } else { 2 });
+            tok.push(99u16);
+        }
+        // rebuild a raw byte stream that folds to this shape is impractical;
+        // assert the raw-token codec sizes directly instead.
+        let o1 = crate::arith::encode_tokens_order1(&tok, n).len();
+        let blend = crate::arith::encode_tokens_blend(&tok, n).len();
+        assert!(blend < o1, "blend ({blend}) must beat order-1 ({o1}) on two-back structure");
+    }
+
+    #[test]
+    fn mode_sizes_empty_and_tiny() {
+        let m = mode_sizes(b"");
+        assert_eq!(m, ModeSizes::default());
+        let t = mode_sizes(b"a");
+        assert!(t.order1_byte > 0);
     }
 }

@@ -62,3 +62,14 @@ AAHL is a research/from-scratch grammar codec: class-competitive on prose, best
 possible on incompressible input (honest STORE), and clearly behind
 general-purpose LZ on big repetitive tables. Its value is the self-contained,
 deterministic, integrity-checked pipeline — not raw ratio vs LZMA2.
+
+## Study
+
+ahl ablate <set_dir> --tsv out.tsv runs a deterministic per-chunk ablation
+(grammar vs stateless vs order-0/1 vs blend) and reports model-footprint bytes
++ wall-clock per row. Findings from the RULE_CTX sweep (8 vs 16 vs 32 vs 64)
+are in docs/ABLATION.md: RULE_CTX stays at 8 (format constant; 16 only wins at
+the non-default 4096 chunk and loses at 262144). The ablation also pinned the
+blend codec as never-winning (rejected) and shipped the decoder overshoot
+stall fix.
+

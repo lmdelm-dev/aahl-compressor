@@ -1,4 +1,5 @@
 mod aahl;
+mod ablation;
 mod arith;
 mod bench;
 mod binning;
@@ -99,6 +100,13 @@ enum Cmd {
     RunBench {
         set_dir: PathBuf,
         #[arg(long, default_value = "bench_results.tsv", help = "write results to this TSV")]
+        tsv: PathBuf,
+    },
+    /// Ablation study: per-corpus payload per chunk size per pipeline mode
+    #[command(name = "ablate")]
+    RunAblate {
+        set_dir: PathBuf,
+        #[arg(long, default_value = "ablation.tsv", help = "write results to this TSV")]
         tsv: PathBuf,
     },
 }
@@ -1075,6 +1083,10 @@ fn main() -> Result<()> {
         Cmd::BuildCorpus { set_dir, source } => corpus::build_corpus(&set_dir, source.as_deref()),
         Cmd::RunBench { set_dir, tsv } => {
             bench::run_bench(&set_dir, &tsv)?;
+            Ok(())
+        }
+        Cmd::RunAblate { set_dir, tsv } => {
+            ablation::run_ablation(&set_dir, &tsv, &ablation::ABLATION_CHUNK_SIZES)?;
             Ok(())
         }
     }

@@ -177,12 +177,28 @@ fn run_external(
     } else {
         let t = work.join(format!("ref.test.{tool}"));
         fs::create_dir_all(&t)?;
-        let (extract_ms, _) = timed(|| {
-            run(
-                bin,
-                &["x", "-y", &format!("-o{}", t.to_string_lossy()), out.to_string_lossy().as_ref()],
-            )
-        })?;
+        let (extract_ms, _) = if tool == "rar" {
+            // Rar x -o+ -y <archive> <dest>
+            timed(|| {
+                run(
+                    bin,
+                    &[
+                        "x",
+                        "-y",
+                        "-o+",
+                        out.to_string_lossy().as_ref(),
+                        t.to_string_lossy().as_ref(),
+                    ],
+                )
+            })?
+        } else {
+            timed(|| {
+                run(
+                    bin,
+                    &["x", "-y", &format!("-o{}", t.to_string_lossy()), out.to_string_lossy().as_ref()],
+                )
+            })?
+        };
         let src = file_hash_map(corpus_dir)?;
         let got = file_hash_map(&t)?;
         (extract_ms, src == got)
@@ -203,6 +219,17 @@ pub fn find_tool(name: &str) -> Option<PathBuf> {
         for p in [
             r"C:\Program Files\7-Zip\7z.exe",
             r"C:\Program Files (x86)\7-Zip\7z.exe",
+        ] {
+            let pb = PathBuf::from(p);
+            if pb.is_file() {
+                return Some(pb);
+            }
+        }
+    }
+    if name == "rar" {
+        for p in [
+            r"C:\Program Files\WinRAR\Rar.exe",
+            r"C:\Program Files (x86)\WinRAR\Rar.exe",
         ] {
             let pb = PathBuf::from(p);
             if pb.is_file() {
@@ -306,6 +333,12 @@ fn external_tools() -> Vec<ExternalTool> {
                 tool: "zstd",
                 bin: "zstd",
                 args: vec!["-19".into(), "-c".into()],
+            },
+            // WinRAR: best compression. Found via find_tool (WinRAR install dir).
+            ExternalTool {
+                tool: "rar",
+                bin: "rar",
+                args: vec!["a".into(), "-m5".into(), "-ep".into()],
             },
         ]
 }
