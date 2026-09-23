@@ -1,4 +1,4 @@
-﻿//! From-scratch carryless range coder (LZMA-style) + adaptive order-0 model.
+//! From-scratch carryless range coder (LZMA-style) + adaptive order-0 model.
 //! Encodes a folded-token stream with per-symbol adaptive counts tracked
 //! through a Fenwick tree, so probabilities converge to the true distribution
 //! without storing a model table in the block.
@@ -94,7 +94,10 @@ impl<'a> Decoder<'a> {
     }
 
     pub fn decode_step(&mut self, start: u64, size: u64, _total: u64) {
-        self.code -= start * self.range;
+        // Corrupt input can drive start*range above code (see threshold
+        // overshoot clamp). Saturating keeps code >= 0 so the renorm
+        // loop below still terminates; valid streams never saturate.
+        self.code = self.code.saturating_sub(start * self.range);
         self.range = self.range.saturating_mul(size);
         if self.range == 0 {
             // corrupt input wrapped range to zero; renormalisation below would

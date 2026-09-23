@@ -1,4 +1,4 @@
-﻿# AAHL ablation study (2026-09)
+# AAHL ablation study (2026-09)
 
 Harness: `aahl ablate <corpus_set> --tsv out.tsv` (see `src/ablation.rs`).
 Every number below is produced by the real codecs, not re-implementations.
@@ -118,3 +118,51 @@ Findings (this drove the shipped defaults):
    `model_footprint_is_bounded_and_reported`); 19782640 bytes at 1 MiB/table
    is the high-water mark and corresponds to the largest alphabet (457
    contexts x 4096 counts x 8 bytes x 2 for Fenwick).
+
+# Phase B: measured table transform - ablation decision record
+
+Harness: `aahl ablate corpus_set --tsv bench/phase-b-ablation.tsv`.
+`grammar` = the v4 payload; `grammar_tx` = the same grammar run where each
+chunk whose oracle-selected transform is emitted as the wrapped T stream
+(real code paths: `table::prepare` + `grammar.compress` + `table::wrap_block`).
+`tx_selected` = unique chunks transformed. Everything deterministic
+(asserted by `ablation_is_deterministic`).
+
+| corpus        | chunk   | raw      | stateless | grammar   | grammar_tx | tx_selected |
+|---------------|---------|----------|-----------|-----------|------------|-------------|
+| table         | 4096    | 9,128,841 | 3,180,611 | 2,305,605 | 2,097,057  | 771         |
+| table         | 16384   | 9,128,841 | 2,426,008 | 2,112,611 | 1,941,542  | 192         |
+| table         | 65536   | 9,128,841 | 1,978,863 | 1,979,079 | 1,925,233  | 47          |
+| table         | 262144  | 9,128,841 | 1,738,931 | 1,738,931 | 1,677,252  | 11          |
+| table         | 1048576*| 9,128,841 | 1,682,478 | 1,673,892 | 1,538,846  | 3 (of 9)    |
+| text-large    | 4096    | 1,375,929 |   805,987 |   415,421 |   415,421  | 0           |
+| text-large    | 65536   | 1,375,929 |   397,483 |   397,483 |   397,483  | 0           |
+| precompressed | 4096    | 2,097,189 | 2,100,267 | 2,100,267 | 2,100,267  | 0           |
+| random        | 4096    | 1,048,576 | 1,050,112 | 1,050,112 | 1,050,112  | 0           |
+| tiny          | 4096    |         1 |         7 |         7 |         7  | 0           |
+
+*1048576 rows come from the real create path (`bench/phase-b-table.tsv`,
+`--table-stats`: 9 chunks, 8 grids, 3 transforms), not the ablation harness.
+
+## Decisions
+
+- **KEPT**: measured table transform (v5). grammar_tx < grammar at every
+  chunk size on table; 0 on every non-table corpus; margins justify the
+  oracle cost for default 1 MiB packing (1,673,892 -> 1,538,846 at the real
+  create path).
+- **KEPT**: strict `b < a` oracle with real codec sizes. Prose/JSON comas
+  survive the detector (grids_found 1) but the oracle declines
+  (transforms_chosen 0) - honest by construction.
+- **KEPT**: transforms scale *down* with chunk size (771/2256 chunks at
+  4096 -> 3/9 at 1 MiB) because small chunks are more often pure grid or
+  pure prose; the oracle never miscounts, and small-chunk gains are large
+  per-byte (2,305,605 -> 2,097,057 = -9.0% at 4096). Tables win most at the
+  size the default does not use, and still win at the default.
+- **REJECTED (not measured, cost-prohibitive)**: per-column adaptive
+  context / column-aware grammar. The T-stream already reorganizes data so
+  the *existing* grammar benefits; adding a second model doubles the model
+  footprint (currently 16-20 MiB high-water at 1 MiB chunks) for a delta the
+  oracle shows is already captured.
+- **INCONCLUSIVE**: `DMODE_DATE` (day-number encoding). Fired on zero
+  real-world rows (no date columns in the synthetic set); unit-tested, kept
+  off by default (`DMODE_NONE` for non-numeric, non-monotonic columns).

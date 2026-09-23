@@ -1,4 +1,4 @@
-﻿//! Scientific ablation harness.
+//! Scientific ablation harness.
 //!
 //! For each corpus directory and each chunk size, this module computes the
 //! payload that every pipeline component would produce over the *unique* chunk
@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use crate::{aahl, corpus, grammar};
+use crate::{aahl, corpus, grammar, table};
 
 pub const ABLATION_CHUNK_SIZES: [usize; 4] = [4096, 16384, 65536, 262144];
 
@@ -39,6 +39,13 @@ pub struct AblationRow {
     pub norec_blend: usize,
     pub grammar: usize,
     pub grammar_norec: usize,
+    /// v5 table-transform payload: same grammar run, but each chunk whose
+    /// measured transform the oracle selected is emitted as the wrapped T
+    /// stream (mirrors the real v5 container, byte-for-byte semantics).
+    pub grammar_tx: usize,
+    /// Number of chunks (of the unique set) for which the table transform
+    /// was chosen by the oracle measurement gate.
+    pub tx_selected: usize,
     pub model_bytes: usize,
     pub create_ms: u64,
 }
@@ -124,6 +131,43 @@ fn run_grammar(
     (payload, footprint, ms)
 }
 
+/// v5-lane ablation: the same grammar lifecycle as run_grammar, but each
+/// chunk is first offered to table::prepare; when the measurement oracle
+/// selects the transform, the epilogue compresses the T stream and wraps it
+/// exactly like the v5 container (grammar.compress + table::wrap_block).
+/// Returns (payload, footprint, tx_selected, elapsed_ms). Deterministic:
+/// prepare + the grammar are pure functions of the chunk bytes.
+fn run_grammar_tx(pieces: &[Vec<u8>]) -> (usize, usize, usize, u64) {
+    let cfg = aahl::FoldConfig::default();
+    let mut g = grammar::PersistentGrammar::with_lag_v4(cfg, 64, 16);
+    let t = Instant::now();
+    let mut payload = 0usize;
+    let mut selected = 0usize;
+    for p in pieces {
+        // prepare drives the same oracle (aahl::compress_block sizes) the
+        // container uses; None -> plain grammar, Some(T) -> wrapped T.
+        let plan = table::prepare(p, None).unwrap_or(None);
+        let (blk, gc) = match &plan {
+            Some(plan) => {
+                selected += 1;
+                g.compress(&plan.t_stream)
+            }
+            None => g.compress(p),
+        };
+        let packed_len = match &plan {
+            Some(plan) => table::wrap_block(&plan.meta, &blk).map(|w| w.len()).unwrap_or(blk.len()),
+            None => blk.len(),
+        };
+        payload += packed_len;
+        if let Some(gc) = gc {
+            payload += gc.len();
+        }
+    }
+    let ms = t.elapsed().as_millis() as u64;
+    let footprint = model_footprint(&g);
+    (payload, footprint, selected, ms)
+}
+
 pub fn run_ablation(
     set_dir: &Path,
     tsv: &Path,
@@ -144,6 +188,7 @@ pub fn run_ablation(
             let (best, fold, order0, o1t, o1b, blend, no1t, nblend) = run_stateless(&pieces);
             let (grammar, model_bytes, ms) = run_grammar(&pieces, false);
             let (grammar_norec, _, _ms2) = run_grammar(&pieces, true);
+            let (grammar_tx, _, tx_selected, _ms3) = run_grammar_tx(&pieces);
             rows.push(AblationRow {
                 corpus: name.clone(),
                 chunk,
@@ -158,6 +203,8 @@ pub fn run_ablation(
                 norec_blend: nblend,
                 grammar,
                 grammar_norec,
+                grammar_tx,
+                tx_selected,
                 model_bytes,
                 create_ms: ms,
             });
@@ -166,13 +213,14 @@ pub fn run_ablation(
 
     // Write TSV.
     let mut out = String::new();
-    out.push_str("corpus\tchunk\traw\tstateless_best\tfold\torder0\torder1_tok\torder1_byte\tblend\tnorec_order1_tok\tnorec_blend\tgrammar\tgrammar_norec\tmodel_bytes\tcreate_ms\n");
+    out.push_str("corpus\tchunk\traw\tstateless_best\tfold\torder0\torder1_tok\torder1_byte\tblend\tnorec_order1_tok\tnorec_blend\tgrammar\tgrammar_norec\tgrammar_tx\ttx_selected\tmodel_bytes\tcreate_ms\n");
     for r in &rows {
         out.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             r.corpus, r.chunk, r.raw, r.stateless_best, r.fold, r.order0,
             r.order1_tok, r.order1_byte, r.blend, r.norec_order1_tok,
-            r.norec_blend, r.grammar, r.grammar_norec, r.model_bytes, r.create_ms
+            r.norec_blend, r.grammar, r.grammar_norec, r.grammar_tx,
+            r.tx_selected, r.model_bytes, r.create_ms
         ));
     }
     if let Some(p) = tsv.parent() {
@@ -182,12 +230,12 @@ pub fn run_ablation(
 
     // Console summary.
     println!(
-        "{:<14} {:>7} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
-        "corpus", "chunk", "raw", "stateless", "order0", "o1tok", "o1byte", "blend", "grammar", "gm-norec"
+        "{:<14} {:>7} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>12} {:>10}",
+        "corpus", "chunk", "raw", "stateless", "order0", "o1tok", "o1byte", "blend", "grammar", "gm-tx", "tx-sel"
     );
     for r in &rows {
         println!(
-            "{:<14} {:>7} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
+            "{:<14} {:>7} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>12} {:>10}",
             r.corpus,
             r.chunk,
             r.raw,
@@ -197,7 +245,8 @@ pub fn run_ablation(
             r.order1_byte,
             r.blend,
             r.grammar,
-            r.grammar_norec
+            r.grammar_tx,
+            r.tx_selected
         );
     }
     Ok(rows)

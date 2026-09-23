@@ -1,4 +1,4 @@
-﻿use anyhow::{bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -42,7 +42,7 @@ fn file_hash_map(dir: &Path) -> Result<Vec<(String, u64, [u8; 32])>> {
     Ok(out)
 }
 
-fn run_aahl(corpus_dir: &Path, root: &Path, exe: &Path, chunk_size: usize) -> Result<Row> {
+fn run_aahl(corpus_dir: &Path, root: &Path, exe: &Path, chunk_size: usize, mode: &str) -> Result<Row> {
     let name = corpus_dir
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
@@ -51,12 +51,17 @@ fn run_aahl(corpus_dir: &Path, root: &Path, exe: &Path, chunk_size: usize) -> Re
     let raw: u64 = files.iter().map(|(_, p)| fs::metadata(p).map(|m| m.len()).unwrap_or(0)).sum();
     let work = root.join("work").join(&name);
     fs::create_dir_all(&work)?;
-    let arc = work.join("aahl.aahl");
+    let arc = work.join(format!("aahl-{mode}.aahl"));
     let (create_ms, _) = timed(|| {
         let mut args = vec!["create".to_string(), arc.to_string_lossy().into_owned()];
         if chunk_size != 1_048_576 {
             args.push("--chunk-size".to_string());
             args.push(chunk_size.to_string());
+        }
+        // v4 lane = --no-table (byte-identical legacy container); v5 lane =
+        // default create with the measured table transform.
+        if mode == "v4" {
+            args.push("--no-table".to_string());
         }
         for (_, p) in &files {
             args.push(p.to_string_lossy().into_owned());
@@ -83,7 +88,7 @@ fn run_aahl(corpus_dir: &Path, root: &Path, exe: &Path, chunk_size: usize) -> Re
     }
     let size = fs::metadata(&arc).map(|m| m.len()).unwrap_or(0);
     Ok(Row {
-        name: format!("{name}/aahl"),
+        name: format!("{name}/aahl-{mode}"),
         raw,
         size,
         create_ms,
@@ -244,7 +249,12 @@ pub fn find_tool(name: &str) -> Option<PathBuf> {
     corpus::which(name)
 }
 
-pub fn run_bench(set_dir: &Path, out_tsv: &Path, chunk_size: usize) -> Result<Vec<Row>> {
+pub fn run_bench(
+    set_dir: &Path,
+    out_tsv: &Path,
+    chunk_size: usize,
+    aahl_modes: &[String],
+) -> Result<Vec<Row>> {
     let exe = std::env::current_exe().context("current_exe")?;
     atmosphere(&exe)?;
     let root = set_dir.parent().unwrap_or(set_dir).to_path_buf();
@@ -253,10 +263,19 @@ pub fn run_bench(set_dir: &Path, out_tsv: &Path, chunk_size: usize) -> Result<Ve
     for d in dirs {
         let name = d.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
         eprintln!("== corpus: {name}");
-        if let Ok(r) = run_aahl(&d, &root, &exe, chunk_size) {
-            rows.push(r);
+        // aahl lanes: "both" (default) -> v4 + v5, else the requested subset
+        let lanes: Vec<String> = if aahl_modes.is_empty() {
+            vec!["v4".into(), "v5".into()]
+        } else if aahl_modes.iter().any(|m| m == "both") {
+            vec!["v4".into(), "v5".into()]
         } else {
-            eprintln!("  aahl: skipped (error)");
+            aahl_modes.to_vec()
+        };
+        for m in &lanes {
+            match run_aahl(&d, &root, &exe, chunk_size, m) {
+                Ok(r) => rows.push(r),
+                Err(e) => eprintln!("  aahl-{m}: {e:#}"),
+            }
         }
         let batch = external_tools();
         for t in batch {

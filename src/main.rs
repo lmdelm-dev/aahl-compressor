@@ -1,4 +1,4 @@
-﻿mod aahl;
+mod aahl;
 mod ablation;
 mod arith;
 mod bench;
@@ -6,7 +6,7 @@ mod binning;
 mod corpus;
 mod grammar;
 mod spectral;
-
+mod table;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use std::collections::HashMap;
@@ -19,10 +19,11 @@ use std::time::Instant;
 const MAGIC_HDR: &[u8; 4] = b"AAHL";
 const MAGIC_FTR: &[u8; 4] = b"AAHE";
 const MAGIC_STORE: &[u8; 2] = b"AS"; // STORE container magic (offset 0)
-const VERSION: u16 = 4;
+const VERSION: u16 = 5;
 const FLAG_FOLD: u16 = 0x0001;
 const FLAG_GLOBAL: u16 = 0x0002; // persistent cross-block grammar (v2 blocks)
 const FLAG_SNAPSHOT: u16 = 0x0004; // reserved (Phase 3 snapshot histories)
+const FLAG_TABLE: u16 = 0x0008; // v5: table-wrapped chunks (FLAG_TABLE set only on v5)
 const HEADER_LEN_V2: u64 = 20; // v1/v2: fixed params header
 const HEADER_LEN_V3: u64 = 22; // v3: + header_checksum u16
 const FOOTER_LEN: u64 = 36; // 4B magic + 4x u64 (offset, len, chunks, files)
@@ -76,6 +77,15 @@ enum Cmd {
         /// unchanged and determinism is unaffected. Off by default.
         #[arg(long, value_name = "FILE")]
         par_stats: Option<PathBuf>,
+        /// Disable the v5 table transform (writes a byte-identical v4 archive).
+        /// Table measurement is also skipped, so this is the exact v4 lane.
+        #[arg(long)]
+        no_table: bool,
+        /// Diagnostics (measurement-gate only): write table-transform counters
+        /// (chunks scanned, grids found, transforms chosen, oracle bytes, delta
+        /// columns) to FILE. Archive bytes are unchanged; determinism holds.
+        #[arg(long, value_name = "FILE")]
+        table_stats: Option<PathBuf>,
     },
     /// List contents
     List {
@@ -103,6 +113,13 @@ enum Cmd {
         #[arg(long, value_name = "DIR", help = "optional source tree for real file corpora (.rs, .exe/.dll)")]
         source: Option<PathBuf>,
     },
+    /// Phase B0: deterministic sample-based table characterization report
+    #[command(name = "char")]
+    RunChar {
+        input: PathBuf,
+        #[arg(long, default_value_t = 1000, help = "max strided sample rows per column")]
+        max_rows: usize,
+    },
     /// Run the benchmark suite over a corpus set, incl. reference tools
     #[command(name = "bench")]
     RunBench {
@@ -111,6 +128,10 @@ enum Cmd {
         tsv: PathBuf,
         #[arg(long, default_value_t = 1_048_576, help = "chunk size in bytes for the aahl lane")]
         chunk_size: usize,
+        /// AAHL container lanes to run: v4 (--no-table legacy), v5 (table
+        /// transform), or both. Each lane emits its own row.
+        #[arg(long, value_delimiter = ',', default_value = "both", help = "aahl lanes: v4, v5, or both")]
+        aahl_modes: Vec<String>,
     },
     /// Phase A1: AAHL-only jobs-scaling benchmark (create/extract per -j N)
     #[command(name = "bench-jobs")]
@@ -297,7 +318,7 @@ fn cmd_create(
     gc_interval: usize,
     jobs: usize,
 ) -> Result<()> {
-    cmd_create_par(archive, inputs, chunk_size, lag, gc_interval, jobs, None)
+    cmd_create_par(archive, inputs, chunk_size, lag, gc_interval, jobs, None, false, None)
 }
 
 /// CLI create entry: validation plus optional Phase A2 parallel diagnostics.
@@ -309,6 +330,8 @@ fn cmd_create_par(
     gc_interval: usize,
     jobs: usize,
     par_stats: Option<&Path>,
+    no_table: bool,
+    table_stats: Option<&Path>,
 ) -> Result<()> {
     if !(1..=1024).contains(&lag) {
         bail!("lag must be 1..1024");
@@ -317,14 +340,17 @@ fn cmd_create_par(
         bail!("gc-interval must be 1..4096");
     }
     let mut stats = ParStats::default();
+    let mut tstats = table::TableStats::default();
+    let version = if no_table { 4 } else { VERSION };
     let res = cmd_create_params_version_impl(
         archive,
         inputs,
         chunk_size,
         pack_params(lag as u64, gc_interval as u64, PARAM_RULES_DEFAULT, 0),
         jobs,
-        VERSION,
+        version,
         if par_stats.is_some() { Some(&mut stats) } else { None },
+        if version >= 5 && table_stats.is_some() { Some(&mut tstats) } else { None },
     );
     if let Some(p) = par_stats {
         if jobs <= 1 {
@@ -334,6 +360,16 @@ fn cmd_create_par(
             );
         } else if let Err(e) = write_par_stats(p, &stats) {
             eprintln!("par-stats write failed: {e:#}");
+        }
+    }
+    if let Some(p) = table_stats {
+        if version < 5 {
+            let _ = std::fs::write(
+                p,
+                "chunks_total\t0\ngrids_found\t0\ntransforms_chosen\t0\nraw_oracle_bytes\t0\nt_side_bytes\t0\noracle_us\t0\ndelta_columns\t0\ngrid_rows\t0\nnote\tv4 lane (--no-table): table transform not run\n",
+            );
+        } else if let Err(e) = write_table_stats(p, &tstats) {
+            eprintln!("table-stats write failed: {e:#}");
         }
     }
     res
@@ -364,7 +400,7 @@ fn cmd_create_params_version(
     jobs: usize,
     version: u16,
 ) -> Result<()> {
-    cmd_create_params_version_impl(archive, inputs, chunk_size, params, jobs, version, None)
+    cmd_create_params_version_impl(archive, inputs, chunk_size, params, jobs, version, None, None)
 }
 
 /// Full create path with explicit params and an optional Phase A2 diagnostics
@@ -378,6 +414,7 @@ fn cmd_create_params_version_impl(
     jobs: usize,
     version: u16,
     par_stats: Option<&mut ParStats>,
+    mut table_stats: Option<&mut table::TableStats>,
 ) -> Result<()> {
     if !(4096..=1_048_576).contains(&chunk_size) {
         bail!("chunk-size must be 4KiB..1MiB (fold is O(n*m), keep small)");
@@ -389,7 +426,12 @@ fn cmd_create_params_version_impl(
     let mut prefix = [0u8; 20];
     prefix[..4].copy_from_slice(MAGIC_HDR);
     prefix[4..6].copy_from_slice(&version.to_le_bytes());
-    prefix[6..8].copy_from_slice(&(FLAG_FOLD | FLAG_GLOBAL).to_le_bytes());
+    let use_table = version >= 5;
+    let mut flags = FLAG_FOLD | FLAG_GLOBAL;
+    if use_table {
+        flags |= FLAG_TABLE;
+    }
+    prefix[6..8].copy_from_slice(&flags.to_le_bytes());
     prefix[8..12].copy_from_slice(&chunk_size.to_le_bytes());
     prefix[12..20].copy_from_slice(&params.to_le_bytes());
     out.write_all(&prefix)?;
@@ -430,6 +472,20 @@ fn cmd_create_params_version_impl(
     let entries = gather.entries;
     let pieces = gather.pieces;
 
+    // v5: stateless, deterministic table-transform plans (B2 measurement
+    // gate). prepare() is a pure function of the raw bytes, so the plan
+    // vector is identical for every worker count and scheduling; v3/v4 keep
+    // an empty vector and never touch the table codec.
+    let plans: Vec<Option<table::TransformPlan>> = if use_table {
+        let mut v = Vec::with_capacity(pieces.len());
+        for p in &pieces {
+            v.push(table::prepare(&p.raw, table_stats.as_deref_mut())?);
+        }
+        v
+    } else {
+        Vec::new()
+    };
+
     // AAHL core: custom fold codec + persistent grammar, NOT zstd/LZ.
     let (lag, gc_interval, _, _) = unpack_params(params);
     let mut grammar = if version >= 4 {
@@ -451,9 +507,9 @@ fn cmd_create_params_version_impl(
     // bounded pipeline runs pure discovery ahead of a strictly serial commit,
     // which keeps the archive byte-identical for any worker count.
     let chunks = if jobs > 1 && lag > 1 {
-        emit_parallel(&mut out, &pieces, &mut grammar, jobs, par_stats)?
+        emit_parallel(&mut out, &pieces, &plans, &mut grammar, jobs, par_stats)?
     } else {
-        emit_serial(&mut out, &pieces, &mut grammar)?
+        emit_serial(&mut out, &pieces, &plans, &mut grammar)?
     };
 
     let table_offset = out.stream_position()?;
@@ -553,15 +609,74 @@ fn write_par_stats(path: &Path, s: &ParStats) -> Result<()> {
     Ok(())
 }
 
+/// Write v5 table-transform measurement counters (TSV, mirrors
+/// write_par_stats). Diagnostics only: `create --table-stats FILE`; the
+/// archive bytes are identical whether or not this sink is attached.
+fn write_table_stats(path: &Path, s: &table::TableStats) -> Result<()> {
+    let txt = format!(
+        "chunks_total\t{}\ngrids_found\t{}\ntransforms_chosen\t{}\nraw_oracle_bytes\t{}\nt_side_bytes\t{}\noracle_us\t{}\ndelta_columns\t{}\ngrid_rows\t{}\n",
+        s.chunks_total, s.grids_found, s.transforms_chosen, s.raw_oracle_bytes,
+        s.t_side_bytes, s.oracle_us, s.delta_columns, s.grid_rows
+    );
+    fs::write(path, txt).with_context(|| format!("write table-stats {}", path.display()))?;
+    Ok(())
+}
+
+/// `aahl char`: Phase B0 table-characterization report. Reads one input
+/// file, runs the deterministic sample-based grid/delimiter characterization,
+/// and prints a TSV-style diagnostic (grid geometry + per-column profile).
+fn cmd_char(input: &Path, max_rows: usize) -> Result<()> {
+    let data = fs::read(input).with_context(|| format!("read {}", input.display()))?;
+    let rep = table::characterize(&data, max_rows);
+    println!("total_bytes\t{}", rep.total_bytes);
+    println!("total_lines\t{}", rep.total_lines);
+    println!("jsonish_lines\t{}", rep.jsonish_lines);
+    match rep.grid {
+        None => println!("grid\tnone"),
+        Some(g) => {
+            println!("grid\tyes");
+            println!("col_delim\t{}", g.col_delim as char);
+            println!("n_cols\t{}", g.n_cols);
+            println!("grid_lines\t{}", g.grid_lines);
+            println!("grid_pct\t{:.2}", g.grid_pct);
+            println!("sample_rows\t{}", g.sample_rows);
+            println!(
+                "col\\tidx\\tfixed\\twidth\\tcardinality\\tint_rows\\tnumeric_pct\\tmonotonic\\tentropy\\tdelta_smaller\\traw_profile\\tdelta_profile"
+            );
+            for c in &g.columns {
+                println!(
+                    "col\\t{}\\t{}\\t{}\\t{}\\t{}\\t{:.1}\\t{}\\t{:.4}\\t{}\\t{}\\t{}",
+                    c.idx, c.fixed, c.width, c.cardinality, c.int_rows,
+                    c.numeric_pct, c.monotonic, c.entropy, c.delta_smaller,
+                    c.raw_profile, c.delta_profile
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn emit_serial(
     out: &mut File,
     pieces: &[Piece],
+    plans: &[Option<table::TransformPlan>],
     grammar: &mut grammar::PersistentGrammar,
 ) -> Result<Vec<ChunkMeta>> {
     let mut chunks: Vec<ChunkMeta> = Vec::with_capacity(pieces.len());
-    for p in pieces {
+    for (i, p) in pieces.iter().enumerate() {
+        let plan = plans.get(i).and_then(|x| x.as_ref());
         // AAHL core: custom fold codec + persistent grammar, NOT zstd/LZ.
-        let (packed, pending_gc) = grammar.compress(&p.raw);
+        // v5: the table transform compresses the column-major T-stream (the
+        // inner codec block), then wraps it in the table header + per-column
+        // payload so decode is byte-exact via table::inverse.
+        let (inner, pending_gc) = match plan {
+            Some(plan) => grammar.compress(&plan.t_stream),
+            None => grammar.compress(&p.raw),
+        };
+        let packed = match plan {
+            Some(plan) => table::wrap_block(&plan.meta, &inner)?,
+            None => inner,
+        };
         // v3 DATA record: kind u8 | body_len u32 | hash(32) | unpacked_len u32 | packed
         out.write_all(&[RECORD_DATA])?;
         let body_len = 32u32 + 4 + packed.len() as u32;
@@ -594,6 +709,7 @@ fn emit_serial(
 fn emit_parallel(
     out: &mut File,
     pieces: &[Piece],
+    plans: &[Option<table::TransformPlan>],
     grammar: &mut grammar::PersistentGrammar,
     jobs: usize,
     stats: Option<&mut ParStats>,
@@ -644,7 +760,14 @@ fn emit_parallel(
             let snap = grammar.snapshot_len_for(r);
             let prefix = grammar.rules_prefix(r).to_vec();
             let epoch = grammar.gc_epoch();
-            let raw = pieces[r].raw.clone();
+            // v5: the worker must discover against the same stream the
+            // commit will compress (plan.t_stream when the table transform
+            // fires, raw otherwise), exactly mirroring emit_serial, so
+            // output stays byte-identical for every worker count.
+            let raw = match plans.get(r).and_then(|x| x.as_ref()) {
+                Some(plan) => plan.t_stream.clone(),
+                None => pieces[r].raw.clone(),
+            };
             let cfg = cfg;
             let (tx, rx) = mpsc::channel();
             let active = std::sync::Arc::clone(&active);
@@ -682,7 +805,17 @@ fn emit_parallel(
                 let valid = grammar.snapshot_len_for(committed) == snap
                     && snap < grammar.rules_len()
                     && grammar.gc_epoch() == epoch;
-                let r = grammar.compress_parallel(cand, snap, epoch, &pieces[committed].raw);
+                let inner = match plans.get(committed).and_then(|x| x.as_ref()) {
+                    Some(plan) => grammar.compress_parallel(cand, snap, epoch, &plan.t_stream),
+                    None => grammar.compress_parallel(cand, snap, epoch, &pieces[committed].raw),
+                };
+                let r = match plans.get(committed).and_then(|x| x.as_ref()) {
+                    Some(plan) => (
+                        table::wrap_block(&plan.meta, &inner.0)?,
+                        inner.1,
+                    ),
+                    None => inner,
+                };
                 if stats_on {
                     s_commit_us += t_commit.elapsed().as_micros() as u64;
                     if valid {
@@ -695,7 +828,17 @@ fn emit_parallel(
             }
             None => {
                 let t_commit = Instant::now();
-                let r = grammar.compress(&pieces[committed].raw);
+                let inner = match plans.get(committed).and_then(|x| x.as_ref()) {
+                    Some(plan) => grammar.compress(&plan.t_stream),
+                    None => grammar.compress(&pieces[committed].raw),
+                };
+                let r = match plans.get(committed).and_then(|x| x.as_ref()) {
+                    Some(plan) => (
+                        table::wrap_block(&plan.meta, &inner.0)?,
+                        inner.1,
+                    ),
+                    None => inner,
+                };
                 if stats_on {
                     s_commit_us += t_commit.elapsed().as_micros() as u64;
                     s_fallback += 1;
@@ -808,7 +951,7 @@ fn open_index(archive: &Path) -> Result<(File, ArchiveIndex)> {
         bail!("bad magic (not aahl)");
     }
     let ver = read_u16(&mut f)?;
-    if !(1..=4).contains(&ver) {
+    if !(1..=5).contains(&ver) {
         bail!("unsupported version {ver}");
     }
     let flags = read_u16(&mut f)?;
@@ -1067,11 +1210,34 @@ fn open_store(mut f: File, flen: u64) -> Result<(File, ArchiveIndex)> {
     ))
 }
 
-fn read_chunk(f: &mut File, meta: &ChunkMeta) -> Result<Vec<u8>> {
-    f.seek(SeekFrom::Start(meta.offset))?;
-    let mut packed = vec![0u8; meta.packed_len as usize];
-    f.read_exact(&mut packed)?;
-    let raw = aahl::decompress_block(&packed, meta.unpacked_len as usize)?;
+/// Decode one chunk payload with the v5 table wrapper in play when
+/// `table_flag` is set: a wrapped chunk is unwrapped (tag + meta), its
+/// inner codec block is decompressed to the T-stream length, then
+/// inverted back to the raw grid rows. When the wrapper tag is absent
+/// (v1-v4 archives, or a v5 chunk whose measurement kept the raw lane)
+/// the payload decodes directly. Hash + length are always verified over
+/// the reconstructed raw bytes.
+fn decode_payload(
+    payload: &[u8],
+    meta: &ChunkMeta,
+    table_flag: bool,
+    decompress: impl FnOnce(&[u8], usize) -> Result<Vec<u8>>,
+) -> Result<Vec<u8>> {
+    if table_flag {
+        if let Some((m, off)) = table::try_unwrap(payload)? {
+            let t = decompress(&payload[off..], m.t_len as usize)?;
+            let raw = table::inverse(&t, &m, meta.unpacked_len as usize)?;
+            if raw.len() as u32 != meta.unpacked_len {
+                bail!("chunk size mismatch after decode");
+            }
+            let h = *blake3::hash(&raw).as_bytes();
+            if h != meta.hash {
+                bail!("chunk hash mismatch (corrupt)");
+            }
+            return Ok(raw);
+        }
+    }
+    let raw = decompress(payload, meta.unpacked_len as usize)?;
     if raw.len() as u32 != meta.unpacked_len {
         bail!("chunk size mismatch after decode");
     }
@@ -1080,6 +1246,13 @@ fn read_chunk(f: &mut File, meta: &ChunkMeta) -> Result<Vec<u8>> {
         bail!("chunk hash mismatch (corrupt)");
     }
     Ok(raw)
+}
+
+fn read_chunk(f: &mut File, meta: &ChunkMeta, table_flag: bool) -> Result<Vec<u8>> {
+    f.seek(SeekFrom::Start(meta.offset))?;
+    let mut packed = vec![0u8; meta.packed_len as usize];
+    f.read_exact(&mut packed)?;
+    decode_payload(&packed, meta, table_flag, |b, n| aahl::decompress_block(b, n))
 }
 
 fn cmd_list(archive: &Path) -> Result<()> {
@@ -1177,7 +1350,7 @@ fn cmd_extract(archive: &Path, out_dir: &Path) -> Result<()> {
                     .with_context(|| format!("GC before chunk {i}"))?;
                 gci += 1;
             }
-            let raw = read_chunk_grammar(&mut f, meta, &mut g)?;
+            let raw = read_chunk_grammar(&mut f, meta, idx.flags & FLAG_TABLE != 0, &mut g)?;
             cache.insert(i as u32, raw);
         }
         cache
@@ -1200,7 +1373,7 @@ fn cmd_extract(archive: &Path, out_dir: &Path) -> Result<()> {
                 v.clone()
             } else {
                 let meta = idx.chunks.get(r as usize).context("bad chunk ref")?;
-                let raw = read_chunk(&mut f, meta)?;
+                let raw = read_chunk(&mut f, meta, idx.flags & FLAG_TABLE != 0)?;
                 cache.insert(r, raw.clone());
                 if cache.len() > 64 {
                     cache.clear();
@@ -1226,20 +1399,13 @@ fn cmd_extract(archive: &Path, out_dir: &Path) -> Result<()> {
 fn read_chunk_grammar(
     f: &mut File,
     meta: &ChunkMeta,
+    table_flag: bool,
     g: &mut grammar::PersistentGrammar,
 ) -> Result<Vec<u8>> {
     f.seek(SeekFrom::Start(meta.offset))?;
     let mut packed = vec![0u8; meta.packed_len as usize];
     f.read_exact(&mut packed)?;
-    let raw = g.decompress(&packed, meta.unpacked_len as usize)?;
-    if raw.len() as u32 != meta.unpacked_len {
-        bail!("chunk size mismatch after decode");
-    }
-    let h = *blake3::hash(&raw).as_bytes();
-    if h != meta.hash {
-        bail!("chunk hash mismatch (corrupt)");
-    }
-    Ok(raw)
+    decode_payload(&packed, meta, table_flag, |b, n| g.decompress(b, n))
 }
 
 fn main() -> Result<()> {
@@ -1253,6 +1419,8 @@ fn main() -> Result<()> {
             gc_interval,
             jobs,
             par_stats,
+            no_table,
+            table_stats,
         } => cmd_create_par(
             &archive,
             &inputs,
@@ -1261,6 +1429,8 @@ fn main() -> Result<()> {
             gc_interval,
             jobs,
             par_stats.as_deref(),
+            no_table,
+            table_stats.as_deref(),
         ),
         Cmd::List { archive } => cmd_list(&archive),
         Cmd::Extract { archive, out_dir } => cmd_extract(&archive, &out_dir),
@@ -1307,8 +1477,8 @@ fn main() -> Result<()> {
             corpus::build_binary_corpus(&set_dir, &source, None)?;
             Ok(())
         }
-        Cmd::RunBench { set_dir, tsv, chunk_size } => {
-            bench::run_bench(&set_dir, &tsv, chunk_size)?;
+        Cmd::RunBench { set_dir, tsv, chunk_size, aahl_modes } => {
+            bench::run_bench(&set_dir, &tsv, chunk_size, &aahl_modes)?;
             Ok(())
         }
         Cmd::RunBenchJobs {
@@ -1333,7 +1503,10 @@ fn main() -> Result<()> {
             bench::run_parstats(&set_dir, &tsv, chunk_size, &jobs, &corpora)?;
             Ok(())
         }
-        Cmd::RunAblate { set_dir, tsv, chunk_sizes } => {
+        Cmd::RunChar { input, max_rows } => {
+            cmd_char(&input, max_rows)
+        }
+                Cmd::RunAblate { set_dir, tsv, chunk_sizes } => {
             ablation::run_ablation(&set_dir, &tsv, &chunk_sizes)?;
             Ok(())
         }
@@ -2009,7 +2182,17 @@ let (_f, idx) = open_index(&arc).unwrap();
 
         let arc4 = dir.join("v4.aahl");
         let arc3 = dir.join("v3.aahl");
-        cmd_create(&arc4, &[src.clone()], 4096, 1, 64, 1).unwrap();
+        // v4 lane: this fixture is comma-heavy, so the v5 table transform
+        // would fire and muddy the v4-vs-v3 semantics under test.
+        cmd_create_params_version(
+            &arc4,
+            &[src.clone()],
+            4096,
+            pack_params(1, 64, PARAM_RULES_DEFAULT, 0),
+            1,
+            4,
+        )
+        .unwrap();
         cmd_create_params_version(
             &arc3,
             &[src.clone()],
@@ -2021,7 +2204,7 @@ let (_f, idx) = open_index(&arc).unwrap();
         .unwrap();
 
         let (_f, idx4) = open_index(&arc4).unwrap();
-        assert_eq!(idx4.version, 4, "new archives must be container v4");
+        assert_eq!(idx4.version, 4, "seam must write a container v4 archive");
         let (_f, idx3) = open_index(&arc3).unwrap();
         assert_eq!(idx3.version, 3, "seam must write a legacy v3 archive");
 
@@ -2050,13 +2233,13 @@ let (_f, idx) = open_index(&arc).unwrap();
         let src = dir.join("x.txt");
         let payload = b"hello world ".repeat(200);
         write_file(&src, &payload);
-        let arc = dir.join("v5.aahl");
+        let arc = dir.join("v6.aahl");
         cmd_create(&arc, &[src], 4096, 1, 64, 1).unwrap();
         let mut bytes = std::fs::read(&arc).unwrap();
-        bytes[4..6].copy_from_slice(&5u16.to_le_bytes());
+        bytes[4..6].copy_from_slice(&6u16.to_le_bytes());
         let mut prefix = [0u8; 20];
         prefix[..4].copy_from_slice(&bytes[..4]);
-        prefix[4..6].copy_from_slice(&5u16.to_le_bytes());
+        prefix[4..6].copy_from_slice(&6u16.to_le_bytes());
         prefix[6..8].copy_from_slice(&bytes[6..8]);
         prefix[8..12].copy_from_slice(&bytes[8..12]);
         prefix[12..20].copy_from_slice(&bytes[12..20]);
@@ -2065,7 +2248,7 @@ let (_f, idx) = open_index(&arc).unwrap();
         let err = open_index(&arc).err().map(|e| format!("{e:#}")).unwrap_or_default();
         assert!(
             open_index(&arc).is_err(),
-            "container version 5 must be rejected, got: {err}"
+            "container version 6 must be rejected, got: {err}"
         );
     }
     #[test]
@@ -2088,7 +2271,17 @@ let (_f, idx) = open_index(&arc).unwrap();
 
         let arc4 = dir.join("v4.aahl");
         let arc3 = dir.join("v3.aahl");
-        cmd_create(&arc4, &[src.clone()], 16384, 16, 64, 1).unwrap();
+        // v4 lane: this fixture is comma-heavy, so the v5 table transform
+        // would fire and muddy the v4-vs-v3 semantics under test.
+        cmd_create_params_version(
+            &arc4,
+            &[src.clone()],
+            16384,
+            pack_params(16, 64, PARAM_RULES_DEFAULT, 0),
+            1,
+            4,
+        )
+        .unwrap();
         cmd_create_params_version(
             &arc3,
             &[src.clone()],

@@ -1,4 +1,4 @@
-﻿# Benchmarks (synthetic corpus, 2026-09)
+# Benchmarks (synthetic corpus, 2026-09)
 
 Generated with `cargo build --release && aahl.exe corpus .\corpus_set &&
 aahl.exe bench .\corpus_set --tsv bench_results.tsv`. Synthetic corpus only
@@ -202,3 +202,43 @@ positioning, one line per corpus class:
 The v4 codec wins text, ties store-lanes, and loses - clearly and predictably -
 on machine code and compressed data. That is the measurement Phase A was
 commissioned to establish.
+
+## B. Phase B: measured table transform (v5)
+
+Harness: `aahl bench corpus_set --tsv bench/phase-b-table.tsv --aahl-modes v4,v5`
+(cargo release, 2026-09). Every row `ok=true` (round-trip blake3-verified in
+both directions). `aahl-v4` = `create --no-table` (byte-identical legacy
+container); `aahl-v5` = default create (measured transform). All corpora are
+from the standard deterministic set.
+
+| corpus        | raw      | aahl-v4 | aahl-v5 | delta size | delta %  | v5 ratio | 7z9    | xz     | zstd   | rar    | zip6   |
+|---------------|----------|--------:|--------:|-----------:|---------:|---------:|-------:|-------:|-------:|-------:|-------:|
+| table         | 9,128,841 | 1,674,390 | 1,538,846 | -135,544  | -8.09%   | 0.1686   | 0.1526 | 0.1528 | 0.1653 | 0.1842 | 0.1849 |
+| text-large    | 1,375,929 |   324,987 |   324,987 |         0  |  0.00%   | 0.2362   | 0.2820 | 0.2821 | 0.2852 | 0.3023 | 0.3224 |
+| precompressed | 2,097,189 | 2,097,334 | 2,097,334 |         0  |  0.00%   | 1.0001   | 0.5005 | 0.5005 | 0.5005 | 0.5005 | 0.5005 |
+| random        | 1,048,576 | 1,048,678 | 1,048,678 |         0  |  0.00%   | 1.0001   | 1.0003 | 1.0001 | 1.0001 | 1.0001 | 1.0001 |
+| tiny          |         1 |       100 |       100 |         0  |  0.00%   | 100.00   | 127.0  | 68.0   | 14.0   | 72.0   | 149.0  |
+| empty         |         0 |       101 |       101 |         0  |  0.00%   | n/a      | 90     | 32     | 13     | 73     | 152    |
+
+### B.1 Phase B takeaway
+
+- **table is the only moved needle, and it moved**: 0.1834 -> 0.1686 ratio
+  (-8.09% size, 1,674,390 -> 1,538,846 B), created with default chunking
+  (9 unique chunks; oracle found 8 grids, transformed 3). v5 closes ~57% of
+  the v4-to-7z9 gap on the table lane (gap was 281,239 B; remaining gap
+  145,305 B to 7z9's 1,393,151).
+- **Zero regressions on any other corpus**: text-large, precompressed,
+  random, tiny, empty are byte-identical between v4 and v5 lanes (and the
+  oracle counters read `transforms_chosen=0`), because the gate is measured,
+  not heuristic. The transform only ever fires when the wrapped T stream is
+  strictly smaller.
+- **Honest cost**: v5 create on table is ~149 s vs v4's ~50 s. The oracle
+  compresses both the raw chunk and the candidate T stream with the real
+  codec; that is the price of a measured gate. Extract is unaffected
+  (181-197 ms, no oracle at read time). The create cost is a documented
+  tradeoff, not a bug; `--no-table` is the fast lane when table content is
+  not expected.
+- **BEFORE/AFTER frame**: v4-vs-v5 delta on the only changed corpus is
+  -135,544 B (-8.09%). Non-table delta is exactly 0. Absolute payload
+  numbers for every ablation component live in `bench/phase-b-ablation.tsv`;
+  the 7-lane table lives in `bench/phase-b-table.tsv`; raw TSV, untrimmed.

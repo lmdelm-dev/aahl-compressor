@@ -1,4 +1,4 @@
-﻿# AAHL design notes
+# AAHL design notes
 
 High-level rationale for the pieces that make AAHL different from "a shell
 around zstd": the persistent folding grammar, snapshot lag, grammar GC, and
@@ -222,3 +222,82 @@ real source/binaries/installer files.
 - **Multivolume / split archives**: nothing in the format prevents splitting
   on record boundaries, but the store-fallback rewrite (Â§SPEC 1.1) happens
   after full compression, so volume sizing must negotiate after create.
+
+## 11. Phase B: measured table transform (the why behind v5)
+
+### 11.1 Problem
+
+The Phase A matrix established exactly one categorical AAHL weakness on the
+synthetic set: table (0.1834 vs 7z9's 0.1526, 5th/6 -- the only loss lane on
+text-shaped data). The grammar is a token/fold model over a byte stream; a
+row-major CSV/JSON grid gives it repeated numeric cell boundaries, no run
+reuse across columns, and a per-row delimit-repeat tax. The data has
+structure, but row-major layout makes the structure invisible to order-1
+models.
+
+### 11.2 Rejected alternatives (measured in B0)
+
+- **No transform; accept the loss**: the target is a text-class packer; a
+  known 18% gap on the flagship text-table corpus is a design miss, not a
+  tuning miss.
+- **External dictionary/preprocessor (BWT, MTF, PPM-style context)**: adds
+  a codec to the pipeline; violates the "no LZ/LZMA/DEFLATE" invariant the
+  project states; and would have to be paid on every chunk.
+- **Heuristic grid detection (uniform delimiters only)**: fragile. JSON-ish
+  lines and prose with commas both pass a naive uniform-count check; a
+  heuristic that fires wrongly must store the raw chunk anyway, so the only
+  honest version is to *measure* before deciding.
+
+### 11.3 Chosen design
+
+Keep the codec byte-identical and add a *measured* pre-pass in front of it:
+
+1. **Detector** (`table::candidate`): delimiter grid over `DELIMS
+   [',', ';', '\t', '|']`, `MIN_GRID_BYTES 64`, `MAX_COLS 4096`,
+   `MAX_EDGE_BYTES 65536`; partial head/tail lines stored verbatim. It is a
+   cheap, broad filter, NOT the gate.
+2. **Oracle** (`table::prepare`): the actual gate. Compress the raw chunk
+   and the T stream with the real codec (`aahl::compress_block`) and compare
+   sizes; the wrapper is always charged. Stateless + deterministic, so the
+   v5 archive is a pure function of chunk bytes.
+3. **Transform** (`table::wrap_block` / `table::inverse`): column-major T
+   stream - `[lengths][values]` per column, uvarint row-order lengths for
+   variable columns, no length stream for fixed-width columns; `DMODE_INT`
+   i64 zigzag-diff and `DMODE_DATE` day-number selected only when their
+   measured profile is smaller.
+4. **Sink**: `create --table-stats FILE` records `chunks_total, grids_found,
+   transforms_chosen, raw_oracle_bytes, t_side_bytes, oracle_us,
+   delta_columns, grid_rows` - measurement diagnostics only, never an input
+   to the byte stream (same contract as ParStats).
+
+### 11.4 Why the oracle cannot be beaten by the detector
+
+Prose with commas scores `grids_found=1, transforms_chosen=0` on the real
+codec (measured): the oracle declines because `wrapper_len + G(T) >= G(raw)`.
+The delta columns and grid characterization (see TABLE-CHAR report) explain
+*why* in absolute numbers; the oracle explains *whether* on the exact bytes.
+The gate is `b < a`, strict, so a transform never makes a chunk larger.
+
+### 11.5 Interaction with determinism
+
+`prepare` is called per piece before the emit loop; `plans: Vec<Option<TransformPlan>>`
+is computed once from pure functions and threaded through both `emit_serial`
+and `emit_parallel`. The parallel path still discovers ahead on the *raw*
+streams (fork_candidate unchanged); only the commit arm looks up the plan.
+Consequence: v5 archives are byte-identical across `--jobs 1/4/8` (verified:
+`phase-b-jobs-scaling.tsv`, blake3 `f3682801...` for table at all three job
+counts).
+
+### 11.6 v3/v4 read seams
+
+`open_index` accepts versions 1..=5. Chunk records are decoded by their own
+first two bytes, not by the header version: a v4 archive inside a v5 reader
+or a v5 archive read by the same binary is handled uniformly. `--no-table`
+locks the header to version 4, so the v4 lane is an *archival* guarantee,
+not just a test hook.
+
+### 11.7 Phase C boundary
+
+Phase B ships the container change and its measurement harness. Phase C
+(snapshot histories on the model, or any future format work) is explicitly
+out of scope for this milestone; `FLAG_SNAPSHOT` (0x0004) remains reserved.

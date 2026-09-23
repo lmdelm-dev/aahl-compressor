@@ -1,4 +1,4 @@
-﻿# AAHL container format spec
+# AAHL container format spec
 
 This document is normative for the v4 format and the v2 STORE container.
 Offsets are little-endian. All sizes are in bytes.
@@ -212,10 +212,116 @@ Same for both containers: `AAHE` + `table_offset u64` + `table_len u64` +
 `table_len` that lands exactly at EOF-36. The store-vs-compressed mode is
 re-detected from the first two bytes (which brutally splits on `AA`/`AS`).
 
+## 5.2 Version 5: measured table transform (Phase B)
+
+v5 is a *container* change, not a codec change: the grammar/fold/token
+streams are byte-identical to v4. The only delta is that a chunk MAY be
+emitted as a table transform stream (T) wrapped in a table header before
+the normal grammar block, when an oracle measurement says the wrapped form
+is strictly smaller than the plain one.
+
+Decision rule (deterministic, stateless, measured - never heuristic):
+
+```
+a = compress_block(raw).len()
+b = wrapper_len(meta) + compress_block(t_stream).len()
+emit transform iff b < a
+```
+
+`compress_block` (aahl.rs) and `wrap_block` (table.rs) are both pure
+functions of their inputs, so the gate is a pure function of chunk bytes:
+determinism (j1/j4/j8 byte-identical) is preserved by construction and
+enforced by the jobs-scaling harness.
+
+### 5.2.1 Header
+
+```
+offset  field                size  value
+0       magic                4     "AAHL"
+4       version              2     = 5
+6       flags                2     FLAG_FOLD (0x0001) | FLAG_GLOBAL (0x0002)
+                                  | FLAG_TABLE (0x0008) when any chunk was
+                                  transformed
+8       chunk_size           4     u32 bytes per chunk (CLI default 1048576)
+12      params               8     u64 packed params (see 2.1)
+20      header_checksum      2     u16 = first 2 bytes of blake3(prefix[0..20])
+```
+
+`create --no-table` forces `version = 4` and writes a v4 archive
+byte-for-byte (the v4 lane in every bench row). Normal create writes v5.
+
+### 5.2.2 Table chunk records (FLAG_TABLE)
+
+When `version >= 5` and the oracle selected the transform for a chunk:
+
+```
+DATA record ([RECORD_DATA] kind | body_len u32 | hash(32) | unpacked_len u32)
+  body  = table_wrapper | t_stream_grammar_block
+
+table_wrapper:
+  byte 0-1   tag       0xA0 0x54  ("T", never produced by any codec tag)
+  meta      core + per-column descriptors (see 5.2.3)
+  t_stream  compressed inner block (grammar block of the column-major
+            transform stream; decompresses to exactly t_len bytes)
+```
+
+The reader does NOT need FLAG_TABLE to decide the decode path: the first two
+bytes of every unpacked body are checked. Codec tags are all `[0xA0, letter]`
+(A/B/C/D/G/R/S); `T` (0x54) is never a tag, so the 2-byte check is
+unambiguous: `A0 T` => un-wrap, verify + invert; anything else => direct
+decode. The flag only short-circuits the check on chunk records where no
+transform was used.
+
+### 5.2.3 Table wrapper metadata
+
+```
+byte 0      version      u8 = 1
+byte 1      kind         u8 = 0 (grid)
+byte 2      row_delim    u8
+byte 3      col_delim    u8
+byte 4-5    n_cols       u16
+byte 6-9    n_rows       u32 (grid rows in the transform)
+byte 10-13  t_len        u32 (exact decompressed length of the inner block)
+byte 14-17  head_len     u32 (bytes of partial head, stored verbatim)
+byte 18-21  tail_len     u32 (bytes of partial tail, stored verbatim)
+then per-column descriptors in order:
+  flags    u8   bit0 = fixed-width; bits1..2 = dmode
+  width    u32  only when bit0 set (fixed-width column byte width)
+
+core = 22 bytes (1+1+1+1+2+4+4+4+4); wrapper_len = 2 + core + descriptors.
+verification on decode: blake3(entry hash) + exact len, same as v4; the
+inner block decompresses to t_len and `table::inverse(raw, meta, len)`
+recovers the original chunk bytes exactly.
+```
+
+### 5.2.4 Transform stream T (column-major)
+
+T is a valid AAHL *codec payload* - a byte stream understood by the same
+grammar path - so the wrapper is transparent to the grammar/decode stages:
+`compressed(T)` is a normal G block. Layout per column:
+
+- variable columns: `[uvarint row-count][uvarint bytes-per-row ...]` then
+  the raw cell bytes, row-major. Fixed-width columns store no length stream.
+- `dmode` = 0 raw cells; 1 = delta (zigzag-diff of consecutive numeric rows);
+  2 = day-number date; 3 reserved. Delta is used ONLY when the measured
+  delta profile is smaller than the raw profile for that column (per-column
+  oracle, so the gate is honest).
+
+### 5.2.5 Why version 5 (v4 -> v5 break)
+
+v4 left table data on the table: the row-major CSV/JSON grid defeats the
+grammar (repeated numeric cell boundaries, no run reuse across columns).
+v5 keeps the codec intact and adds a measured column-major re-layout before
+it - the same class of win a BWT/MTF gives LZ, but deterministic and
+opt-in per chunk. The `--no-table` v4 lane stays byte-identical for
+comparability and for archives that must not change.
+
 ## 7. Compatibility matrix
 
 | Format | Produced by | Read by |
 |--------|-------------|---------|
-| v3 compressed (version=3) | current `create` | current `extract` |
+| v5 compressed (version=5, FLAG_TABLE 0x0008) | current `create` (default, table transform) | current `extract` |
+| v4 compressed (version=4) | current `create --no-table`; all pre-Phase-B archives | current `extract` |
+| v3 compressed (version=3) | never emitted now | current `extract` (read test v3) |
 | STORE v2 (`AS` version=2) | current `create` (incompressible) | current `extract` |
 | v2/older feature flags | never emitted now | rejected (checksum/version guard) |
