@@ -1,0 +1,25 @@
+[package]
+name = "aahl-shellext"
+version.workspace = true
+edition.workspace = true
+description = "AAHL Windows right-click context menu shell extension"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[target.'cfg(windows)'.dependencies]
+windows-core = { version = "0.62" }
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Ole",
+    "Win32_System_Registry",
+    "Win32_Security",
+    "Win32_System_Threading",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+] }

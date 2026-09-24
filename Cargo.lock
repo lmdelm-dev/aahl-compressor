@@ -28,6 +28,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "aahl-shellext"
+version = "0.2.0"
+dependencies = [
+ "windows",
+ "windows-core",
+]
+
+[[package]]
 name = "accesskit"
 version = "0.24.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

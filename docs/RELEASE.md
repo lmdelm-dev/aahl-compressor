@@ -6,8 +6,13 @@ How to publish an AAHL release.
 
 | Artifact | Platform | How it's built |
 |---|---|---|
-| `aahl-x.y.z-x86_64-pc-windows-msvc.zip` (CLI + GUI) | Windows x64 | `cargo build --release --workspace` |
+| `aahl-x.y.z-x86_64-pc-windows-msvc.zip` (CLI + GUI + shell extension) | Windows x64 | `cargo build --release --workspace` |
 | `aahl-x.y.z-x86_64-unknown-linux-musl.tar.gz` (CLI) | Linux x64, static | `scripts/build-linux.sh` |
+
+The Windows zip contains: `aahl.exe`, `aahl-gui.exe`, `aahl_shellext.dll`,
+`install-context-menu.ps1`, `uninstall-context-menu.ps1`. The shell extension
+is per-user (`HKCU`), never needs elevation, and is optional: `aahl.exe` and
+`aahl-gui.exe` work alone.
 
 The Linux binary is statically linked musl, so one build runs on every Linux
 distribution (glibc or musl) without dependency installation.
@@ -39,14 +44,34 @@ distribution (glibc or musl) without dependency installation.
 
 4. **Verify the suite** (both runtimes):
    ```
-   cargo test --release            # 118 container/unit/fuzz tests
+   cargo test --release             # 118 container/unit/fuzz tests
    cargo test --release -p aahl-gui # 4 backend tests
+   cargo test --release -p aahl-shellext  # 18 unit + COM smoke tests
    ```
+   The shellext smoke tests build and exercise the real DLL: exports, COM
+   class-factory instantiation, cross-interface QI, aggregation refusal, and
+   a registration round-trip against real `HKCU` (skipped when the CLSID is
+   already registered).
 
-5. **Commit** version bump + any doc changes (`docs/RELEASE.md`, README
+5. **Shell-extension acceptance** (Windows):
+   ```
+   powershell -ExecutionPolicy Bypass -File .\install-context-menu.ps1
+   ```
+   Confirm `HKCU\Software\Classes\CLSID\{FF2729B8-37AC-4416-B770-EF81D8E5F168}\InprocServer32`
+   points at the release DLL, then in PowerShell instantiate the class
+   through the registered CLSID:
+   ```powershell
+   $c = [guid]'{FF2729B8-37AC-4416-B770-EF81D8E5F168}'
+   [Activator]::CreateInstance([type]::GetTypeFromCLSID($c))   # must succeed
+   ```
+   Right-click any file in Explorer (new windows show the menu without a
+   restart); then `uninstall-context-menu.ps1` and confirm activation now
+   fails with REGDB_E_CLASSNOTREG (0x80040154).
+
+6. **Commit** version bump + any doc changes (`docs/RELEASE.md`, README
    updates, `LICENSE`, `scripts/`).
 
-6. **Tag and release** (requires `gh` authenticated):
+7. **Tag and release** (requires `gh` authenticated):
    ```
    git tag -a "v$VERSION" -m "aahl $VERSION"
    git push origin main

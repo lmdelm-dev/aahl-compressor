@@ -1,5 +1,5 @@
 [workspace]
-members = ["gui"]
+members = ["gui", "shellext"]
 resolver = "2"
 
 [workspace.package]

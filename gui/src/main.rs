@@ -9,6 +9,16 @@ use eframe::egui;
 use std::path::{Path, PathBuf};
 
 fn main() -> eframe::Result {
+    // Headless entry from the Explorer context menu: `aahl-gui --create
+    // <files...>` creates an archive without opening the window. Exit codes:
+    // 0 = created, 1 = error, 3 = save dialog cancelled (silent no-op).
+    let mut args = std::env::args().skip(1);
+    if args.next().as_deref() == Some("--create") {
+        let files: Vec<PathBuf> = args.map(PathBuf::from).collect();
+        create_mode(&files);
+        return Ok(());
+    }
+
     let wgpu_setup = eframe::egui_wgpu::WgpuSetup::CreateNew(
         eframe::egui_wgpu::WgpuSetupCreateNew {
             instance_descriptor: {
@@ -36,6 +46,52 @@ fn main() -> eframe::Result {
         options,
         Box::new(|_cc| Ok(Box::new(App::new()))),
     )
+}
+
+/// Headless `--create <files...>` mode: prompt for the archive destination,
+/// create it with the real engine, and exit. Never opens the GUI window.
+fn create_mode(files: &[PathBuf]) {
+    if files.is_empty() {
+        eprintln!("aahl-gui: --create requires at least one input file");
+        std::process::exit(1);
+    }
+    let engine = match CliEngine::discover() {
+        Ok(e) => e,
+        Err(err) => {
+            eprintln!("aahl-gui: {err:#}");
+            std::process::exit(1);
+        }
+    };
+    // AAHL_GUI_OUT overrides the save dialog (automation/test seam and a way
+    // for scripts to add files to an archive without interaction).
+    let archive = match std::env::var("AAHL_GUI_OUT") {
+        Ok(path) => PathBuf::from(path),
+        Err(_) => {
+            let Some(picked) = rfd::FileDialog::new()
+                .set_file_name("out.aahl")
+                .set_directory(files[0].parent().unwrap_or(Path::new(".")))
+                .save_file()
+            else {
+                std::process::exit(3); // user cancelled: silent, not an error
+            };
+            picked
+        }
+    };
+    match engine.create(&archive, files) {
+        Ok(info) => {
+            eprintln!(
+                "created: {files} files, {raw} raw -> {arch} archive at {}",
+                archive.display(),
+                files = info.files,
+                raw = info.raw_bytes,
+                arch = format_size(info.archive_bytes),
+            );
+        }
+        Err(e) => {
+            eprintln!("aahl-gui: {e:#}");
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Persistent per-archive UI state.
@@ -97,9 +153,7 @@ impl App {
                 }
             }
         };
-    }
-
-    fn open_picker(&mut self) {
+    }    fn open_picker(&mut self) {
         let picked = rfd::FileDialog::new()
             .add_filter("aahl archive", &["aahl"])
             .pick_file();

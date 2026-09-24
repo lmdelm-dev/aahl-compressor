@@ -1,4 +1,4 @@
-﻿# AAHL - grammar-folding archive
+# AAHL - grammar-folding archive
 
 AAHL is a from-scratch lossless compressor (no LZ77/Huffman-per-block like zip,
 no PPM like rar, no zstd/lzma crates). It compresses by building a persistent
@@ -84,6 +84,20 @@ then a sibling `aahl` executable next to the GUI. It uses the wgpu
 backend (DX12/Vulkan) and includes a `Demo` toggle backed by a fake
 engine so the UI is usable without the CLI.
 
+## Windows shell extension
+
+`shellext` registers Explorer context-menu commands (add to archive, extract
+here / to folder, test) for the current user, without elevation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install-context-menu.ps1
+```
+
+From a release build the zip contains `aahl.exe`, `aahl-gui.exe`,
+`aahl_shellext.dll` and the two `.ps1` scripts. The menu drives the real
+engine: `aahl-gui --create <files...>` for new archives (save dialog), the
+CLI for extract/test. Uninstall with `.\uninstall-context-menu.ps1`; see
+`docs/SHELLEXT.md` for the registry layout, discovery order, and verification.
 ## Format
 
 Two containers share the footer:
