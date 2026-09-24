@@ -1,0 +1,47 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    name: Windows CLI + GUI
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --workspace
+      - name: Package zip
+        shell: pwsh
+        run: |
+          $ver = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"').Matches[0].Groups[1].Value
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive -Path target/release/aahl.exe, target/release/aahl-gui.exe `
+            -DestinationPath dist/aahl-$ver-x86_64-pc-windows-msvc.zip
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/aahl-*-x86_64-pc-windows-msvc.zip
+
+  linux:
+    name: Linux CLI (musl, static)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: Install musl linker
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: scripts/build-linux.sh
+      - run: |
+          ver=$(grep -oP '^version = "\K[^"]+' Cargo.toml)
+          mkdir -p dist
+          tar -C target/x86_64-unknown-linux-musl/release -czf dist/aahl-$ver-x86_64-unknown-linux-musl.tar.gz aahl
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/aahl-*-x86_64-unknown-linux-musl.tar.gz
