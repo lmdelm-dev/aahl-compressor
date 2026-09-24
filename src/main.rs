@@ -86,11 +86,25 @@ enum Cmd {
         /// columns) to FILE. Archive bytes are unchanged; determinism holds.
         #[arg(long, value_name = "FILE")]
         table_stats: Option<PathBuf>,
+        /// Emit a machine-readable JSON summary
+        #[arg(long)]
+        json: bool,
     },
     /// List contents
     List {
         #[arg(value_name = "ARCHIVE")]
         archive: PathBuf,
+        /// Emit a machine-readable JSON index
+        #[arg(long)]
+        json: bool,
+    },
+    /// Verify archive integrity (decode every chunk, check hashes/lengths)
+    Test {
+        #[arg(value_name = "ARCHIVE")]
+        archive: PathBuf,
+        /// Emit a machine-readable JSON report
+        #[arg(long)]
+        json: bool,
     },
     /// Extract archive
     Extract {
@@ -318,7 +332,7 @@ fn cmd_create(
     gc_interval: usize,
     jobs: usize,
 ) -> Result<()> {
-    cmd_create_par(archive, inputs, chunk_size, lag, gc_interval, jobs, None, false, None)
+    cmd_create_par(archive, inputs, chunk_size, lag, gc_interval, jobs, None, false, None, false)
 }
 
 /// CLI create entry: validation plus optional Phase A2 parallel diagnostics.
@@ -332,6 +346,7 @@ fn cmd_create_par(
     par_stats: Option<&Path>,
     no_table: bool,
     table_stats: Option<&Path>,
+    json: bool,
 ) -> Result<()> {
     if !(1..=1024).contains(&lag) {
         bail!("lag must be 1..1024");
@@ -372,7 +387,25 @@ fn cmd_create_par(
             eprintln!("table-stats write failed: {e:#}");
         }
     }
-    res
+    match res {
+        Ok(info) => {
+            if json {
+                println!("{}", serde_json::to_string(&info)?);
+            } else if info.store {
+                println!(
+                    "aahl: {} files stored raw ({}B <= {}B archive)",
+                    info.files, info.archive_bytes, info.raw_bytes
+                );
+            } else {
+                println!(
+                    "aahl: {} files, {} unique chunks ({}B raw -> {}B archive)",
+                    info.files, info.unique_chunks, info.raw_bytes, info.archive_bytes
+                );
+            }
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Full create path with explicit params (tests inject a short GC interval to
@@ -384,7 +417,7 @@ fn cmd_create_params(
     chunk_size: u32,
     params: u64,
     jobs: usize,
-) -> Result<()> {
+) -> Result<CreateInfoJson> {
     cmd_create_params_version(archive, inputs, chunk_size, params, jobs, VERSION)
 }
 
@@ -399,7 +432,7 @@ fn cmd_create_params_version(
     params: u64,
     jobs: usize,
     version: u16,
-) -> Result<()> {
+) -> Result<CreateInfoJson> {
     cmd_create_params_version_impl(archive, inputs, chunk_size, params, jobs, version, None, None)
 }
 
@@ -415,7 +448,7 @@ fn cmd_create_params_version_impl(
     version: u16,
     par_stats: Option<&mut ParStats>,
     mut table_stats: Option<&mut table::TableStats>,
-) -> Result<()> {
+) -> Result<CreateInfoJson> {
     if !(4096..=1_048_576).contains(&chunk_size) {
         bail!("chunk-size must be 4KiB..1MiB (fold is O(n*m), keep small)");
     }
@@ -555,19 +588,21 @@ fn cmd_create_params_version_impl(
         out.seek(SeekFrom::Start(0))?;
         write_store_archive(&mut out, &files)?;
         let total = out.stream_position()?;
-        println!(
-            "aahl: {} files stored raw ({total}B <= {raw_total}B, compressed was {compressed_total}B)",
-            entries.len()
-        );
-        return Ok(());
+        return Ok(CreateInfoJson {
+            files: entries.len(),
+            unique_chunks: 0,
+            raw_bytes: raw_total,
+            archive_bytes: total,
+            store: true,
+        });
     }
-    println!(
-        "aahl: {} files, {} unique chunks ({}B raw -> {compressed_total}B archive)",
-        entries.len(),
-        chunks.len(),
-        raw_total
-    );
-    Ok(())
+    Ok(CreateInfoJson {
+        files: entries.len(),
+        unique_chunks: chunks.len(),
+        raw_bytes: raw_total,
+        archive_bytes: compressed_total,
+        store: false,
+    })
 }
 
 struct Piece {
@@ -912,6 +947,62 @@ fn write_store_archive(out: &mut File, files: &[(String, PathBuf)]) -> Result<()
     Ok(())
 }
 
+
+/// Machine-readable `create` summary (also printed by `--json`).
+#[derive(serde::Serialize, Default)]
+pub struct CreateInfoJson {
+    pub files: usize,
+    pub unique_chunks: usize,
+    pub raw_bytes: u64,
+    pub archive_bytes: u64,
+    pub store: bool,
+}
+
+#[derive(serde::Serialize)]
+pub struct ListEntryJson {
+    pub path: String,
+    pub size: u64,
+    pub chunks: usize,
+}
+
+#[derive(serde::Serialize)]
+pub struct ListInfoJson {
+    pub version: u16,
+    pub store: bool,
+    pub chunk_size: u32,
+    pub total_files: usize,
+    pub total_size: u64,
+    pub unique_chunks: usize,
+    pub files: Vec<ListEntryJson>,
+}
+
+#[derive(serde::Serialize)]
+pub struct TestReportJson {
+    pub ok: bool,
+    pub files_checked: usize,
+    pub errors: Vec<String>,
+}
+
+/// Build the machine-readable listing for an opened index.
+fn index_list_info(idx: &ArchiveIndex) -> ListInfoJson {
+    ListInfoJson {
+        version: idx.version,
+        store: idx.store_mode,
+        chunk_size: idx.chunk_size,
+        total_files: idx.files.len(),
+        total_size: idx.files.iter().map(|e| e.file_len).sum(),
+        unique_chunks: idx.chunks.len(),
+        files: idx
+            .files
+            .iter()
+            .map(|e| ListEntryJson {
+                path: e.path.clone(),
+                size: e.file_len,
+                chunks: e.refs.len(),
+            })
+            .collect(),
+    }
+}
 struct ArchiveIndex {
     version: u16,
     flags: u16,
@@ -1255,26 +1346,123 @@ fn read_chunk(f: &mut File, meta: &ChunkMeta, table_flag: bool) -> Result<Vec<u8
     decode_payload(&packed, meta, table_flag, |b, n| aahl::decompress_block(b, n))
 }
 
-fn cmd_list(archive: &Path) -> Result<()> {
+fn cmd_list(archive: &Path, json: bool) -> Result<()> {
     let (_f, idx) = open_index(archive)?;
+    if json {
+        println!("{}", serde_json::to_string(&index_list_info(&idx))?);
+        return Ok(());
+    }
     if idx.store_mode {
-        println!("STORE container (raw payload)");
         println!("{:>12}  {}", "SIZE", "PATH");
         for e in &idx.files {
             println!("{:>12}  {}", e.file_len, e.path);
         }
         println!("{} files, raw on disk", idx.files.len());
-        return Ok(());
+    } else {
+        println!("{:>12}  {:>6}  {}  (v{})", "SIZE", "CHUNKS", "PATH", idx.version);
+        for e in &idx.files {
+            println!("{:>12}  {:>6}  {}", e.file_len, e.refs.len(), e.path);
+        }
+        println!("{} files, {} unique chunks", idx.files.len(), idx.chunks.len());
     }
-    println!("{:>12}  {:>6}  {}  (v{})", "SIZE", "CHUNKS", "PATH", idx.version);
+    Ok(())
+}
+
+/// Decode every chunk in index order and verify hashes/lengths (same codecs
+/// as extraction). Store containers were already fully verified at open time.
+/// Collects errors without aborting early so a full report is produced.
+fn verify_archive(f: &mut File, idx: &ArchiveIndex) -> Result<TestReportJson> {
+    let mut errors: Vec<String> = Vec::new();
+    if idx.store_mode {
+        // open_store verified every payload slice (hash + length) at open.
+        return Ok(TestReportJson { ok: true, files_checked: idx.files.len(), errors });
+    }
+    let table_flag = idx.flags & FLAG_TABLE != 0;
+    if idx.flags & FLAG_GLOBAL != 0 {
+        // v3+ persistent grammar: decode must go through one grammar in order,
+        // applying interleaved GC records at their boundaries.
+        let mut g = if idx.version >= 4 {
+            grammar::PersistentGrammar::new_v4(aahl::FoldConfig::default(), 64)
+        } else {
+            grammar::PersistentGrammar::default()
+        };
+        let mut gci = 0usize;
+        'chunks: for (i, meta) in idx.chunks.iter().enumerate() {
+            while gci < idx.gcs.len() && (idx.gcs[gci].data_before as usize) == i {
+                if let Err(e) = g
+                    .apply_gc(&idx.gcs[gci].survivors)
+                    .with_context(|| format!("GC before chunk {i}"))
+                {
+                    errors.push(format!("chunk {i}: {e:#}"));
+                    break 'chunks;
+                }
+                gci += 1;
+            }
+            if let Err(e) = read_chunk_grammar(f, meta, table_flag, &mut g) {
+                errors.push(format!("chunk {i}: {e:#}"));
+                break 'chunks;
+            }
+        }
+    } else {
+        for (i, meta) in idx.chunks.iter().enumerate() {
+            if let Err(e) = read_chunk(f, meta, table_flag) {
+                errors.push(format!("chunk {i}: {e:#}"));
+                break;
+            }
+        }
+    }
+    // Per-file ref/length consistency.
     for e in &idx.files {
-        println!("{:>12}  {:>6}  {}", e.file_len, e.refs.len(), e.path);
+        if idx.store_mode {
+            continue;
+        }
+        let mut sum = 0u64;
+        let mut ref_err = false;
+        for &r in &e.refs {
+            match idx.chunks.get(r as usize) {
+                Some(m) => sum += m.unpacked_len as u64,
+                None => {
+                    errors.push(format!("{}: bad chunk ref {r}", e.path));
+                    ref_err = true;
+                    break;
+                }
+            }
+        }
+        if !ref_err && sum != e.file_len {
+            errors.push(format!(
+                "{}: length mismatch (refs sum {sum}B, table says {}B)",
+                e.path, e.file_len
+            ));
+        }
     }
-    println!(
-        "{} files, {} unique chunks",
-        idx.files.len(),
-        idx.chunks.len()
-    );
+    Ok(TestReportJson {
+        ok: errors.is_empty(),
+        files_checked: idx.files.len(),
+        errors,
+    })
+}
+
+/// `aahl test <ARCHIVE>`: integrity check. Non-zero exit on any error.
+fn cmd_test(archive: &Path, json: bool) -> Result<()> {
+    let (mut f, idx) = open_index(archive)?;
+    let report = verify_archive(&mut f, &idx)?;
+    if json {
+        println!("{}", serde_json::to_string(&report)?);
+    } else if report.ok {
+        println!(
+            "aahl: {} files verified OK (v{}, {} unique chunks)",
+            report.files_checked,
+            idx.version,
+            idx.chunks.len()
+        );
+    } else {
+        for e in &report.errors {
+            eprintln!("error: {e}");
+        }
+    }
+    if !report.ok {
+        bail!("integrity check failed for {} ({} error(s))", archive.display(), report.errors.len());
+    }
     Ok(())
 }
 
@@ -1421,6 +1609,7 @@ fn main() -> Result<()> {
             par_stats,
             no_table,
             table_stats,
+            json,
         } => cmd_create_par(
             &archive,
             &inputs,
@@ -1431,9 +1620,11 @@ fn main() -> Result<()> {
             par_stats.as_deref(),
             no_table,
             table_stats.as_deref(),
+            json,
         ),
-        Cmd::List { archive } => cmd_list(&archive),
+        Cmd::List { archive, json } => cmd_list(&archive, json),
         Cmd::Extract { archive, out_dir } => cmd_extract(&archive, &out_dir),
+        Cmd::Test { archive, json } => cmd_test(&archive, json),
         Cmd::BlockSize { input, sweep } => {
             let data = std::fs::read(&input).with_context(|| format!("read {}", input.display()))?;
             let (folded, arith, o1t, o1b, final_len, raw, mode) = aahl::block_sizes(&data);
@@ -2301,5 +2492,173 @@ let (_f, idx) = open_index(&arc).unwrap();
         cmd_extract(&arc4, &dir.join("e4")).unwrap();
         let got = std::fs::read(dir.join("e4").join("src").join("a.txt")).unwrap();
         assert_eq!(got, blob);
+    }
+
+
+    // ---------- release: `aahl test` + JSON output (0.2.0) ----------
+
+    #[test]
+    fn aahl_test_command_ok_on_compressed_roundtrip() {
+        let dir = scratch("testok");
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let mut blob = String::new();
+        for i in 0..1000 {
+            blob.push_str(&format!("{i}: the quick brown fox jumps over the lazy dog while the farmer watches from the barn door\n"));
+        }
+        let blob = blob.into_bytes();
+        write_file(&src.join("a.txt"), &blob);
+        write_file(&src.join("b.txt"), &blob);
+        let arc = dir.join("out.aahl");
+        cmd_create(&arc, &[src.clone()], 4096, 1, 64, 1).unwrap();
+        // must not return Err, must not print FAIL
+        cmd_test(&arc, false).unwrap();
+    }
+
+    #[test]
+    fn aahl_test_command_ok_on_store_container() {
+        let dir = scratch("teststore");
+        let src = dir.join("rand.bin");
+        let mut data = Vec::with_capacity(65536);
+        for i in 0..2048u64 {
+            let h = blake3::hash(&i.to_le_bytes());
+            data.extend_from_slice(&h.as_bytes()[..32]);
+        }
+        write_file(&src, &data);
+        let arc = dir.join("store.aahl");
+        cmd_create(&arc, &[src.clone()], 4096, 1, 64, 1).unwrap();
+        let (_f, idx) = open_index(&arc).unwrap();
+        assert!(idx.store_mode);
+        cmd_test(&arc, false).unwrap();
+    }
+
+    #[test]
+    fn aahl_test_command_detects_payload_corruption() {
+        let dir = scratch("testcorrupt");
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let mut blob = String::new();
+        for i in 0..800 {
+            blob.push_str(&format!("{i}: the quick brown fox and the lazy dog run through the barn at dawn, then rest.\n"));
+        }
+        write_file(&src.join("a.txt"), blob.as_bytes());
+        let arc = dir.join("out.aahl");
+        cmd_create(&arc, &[src.clone()], 4096, 1, 64, 1).unwrap();
+        let good = std::fs::read(&arc).unwrap();
+        let table_offset =
+            u64::from_le_bytes(good[good.len() - 32..good.len() - 24].try_into().unwrap());
+        // flip payload bytes inside the chunk region (after header, before table)
+        let mut flipped = good.clone();
+        let pos = (HEADER_LEN_V3 + 10) as usize;
+        assert!((pos as u64) < table_offset);
+        flipped[pos] ^= 0xFF;
+        let p = dir.join("flip.aahl");
+        std::fs::write(&p, &flipped).unwrap();
+        assert!(
+            cmd_test(&p, false).is_err(),
+            "payload corruption must fail integrity test"
+        );
+        // truncation mid-payload must fail too
+        let cut = good.len() / 2;
+        let p = dir.join("trunc.aahl");
+        std::fs::write(&p, &good[..cut]).unwrap();
+        assert!(cmd_test(&p, false).is_err(), "truncation must fail integrity test");
+    }
+
+    #[test]
+    fn aahl_test_command_json_emits_ok_and_errors() {
+        let dir = scratch("testjson");
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let blob = b"integrity json probe ".repeat(400);
+        write_file(&src.join("a.txt"), &blob);
+        let arc = dir.join("out.aahl");
+        cmd_create(&arc, &[src.clone()], 4096, 1, 64, 1).unwrap();
+        // capture stdout via a pipe is heavy; instead test the pure report
+        // builder by re-running open+verify through the same code path.
+        let (mut f, idx) = open_index(&arc).unwrap();
+        let rep = verify_archive(&mut f, &idx).unwrap();
+        assert!(rep.errors.is_empty());
+        let ser = serde_json::to_string(&rep).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&ser).unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["errors"].as_array().unwrap().len(), 0);
+        drop(f);
+    }
+
+    #[test]
+    fn aahl_test_json_errors_nonempty_on_length_mismatch() {
+        // a hand-built table whose refs sum does not equal file_len must be
+        // reported as a per-file error, not a panic.
+        let dir = scratch("testlenerr");
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let blob = b"length check ".repeat(30);
+        write_file(&src.join("a.txt"), &blob);
+        let arc = dir.join("out.aahl");
+        // build a compressed archive then patch the table file_len field
+        cmd_create(&arc, &[src.clone()], 4096, 1, 64, 1).unwrap();
+        let good = std::fs::read(&arc).unwrap();
+        let table_offset =
+            u64::from_le_bytes(good[good.len() - 32..good.len() - 24].try_into().unwrap());
+        // table: nfiles u64 | (path_len u16 | path | file_len u64 | nrefs u64 | refs...)
+        let nfiles =
+            u64::from_le_bytes(good[table_offset as usize..table_offset as usize + 8].try_into().unwrap());
+        assert_eq!(nfiles, 1);
+        let path_len = u16::from_le_bytes(
+            good[table_offset as usize + 8..table_offset as usize + 10].try_into().unwrap(),
+        ) as usize;
+        let file_len_off = table_offset as usize + 10 + path_len;
+        let mut tampered = good.clone();
+        // file_len u64 -> set impossibly large
+        tampered[file_len_off..file_len_off + 8].copy_from_slice(&(u64::MAX / 2).to_le_bytes());
+        let p = dir.join("len.aahl");
+        std::fs::write(&p, &tampered).unwrap();
+        let (mut f, idx) = open_index(&p).unwrap();
+        assert_eq!(idx.files[0].file_len, u64::MAX / 2);
+        let rep = verify_archive(&mut f, &idx).unwrap();
+        assert!(!rep.errors.is_empty(), "refs/len mismatch must be reported");
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&rep).unwrap()).unwrap();
+        assert_eq!(v["ok"], false);
+    }
+
+    #[test]
+    fn aahl_list_json_emits_index_fields() {
+        let dir = scratch("listjson");
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let blob = b"list json probe data ".repeat(200);
+        write_file(&src.join("a.txt"), &blob);
+        write_file(&src.join("b.txt"), &blob);
+        let arc = dir.join("out.aahl");
+        cmd_create(&arc, &[src.clone()], 4096, 1, 64, 1).unwrap();
+        let (_f, idx) = open_index(&arc).unwrap();
+        let info = index_list_info(&idx);
+        let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&info).unwrap()).unwrap();
+        assert_eq!(v["version"], 5);
+        assert_eq!(v["store"], false);
+        assert_eq!(v["total_files"], 2);
+        assert_eq!(v["unique_chunks"], v["files"][0]["chunks"]);
+        assert_eq!(v["files"][0]["path"], "src/a.txt");
+        assert_eq!(v["files"][1]["path"], "src/b.txt");
+        assert!(v["files"][0]["size"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn aahl_create_json_reports_counts() {
+        let dir = scratch("createjson");
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let blob = b"create json summary ".repeat(300);
+        write_file(&src.join("a.txt"), &blob);
+        let arc = dir.join("out.aahl");
+        let s = cmd_create_params(&arc, &[src.clone()], 4096, pack_params(1, 64, PARAM_RULES_DEFAULT, 0), 1).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(v["files"], 1);
+        assert!(v["unique_chunks"].as_u64().unwrap() >= 1);
+        assert!(v["raw_bytes"].as_u64().unwrap() > 0);
+        assert!(v["archive_bytes"].as_u64().unwrap() > 0);
+        assert!(v["archive_bytes"].as_u64().unwrap() <= v["raw_bytes"].as_u64().unwrap());
     }
 }

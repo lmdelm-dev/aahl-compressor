@@ -1186,7 +1186,7 @@ mod tests {
         assert_eq!(parse_gc_body(&rec[5..]).unwrap(), vec![0]);
         // corrupted framing is rejected, never panics
         assert!(parse_gc_body(&[]).is_err()); // too small
-        assert_eq!(parse_gc_body(&[0u8, 0, 0, 0, 0]).unwrap(), vec![]); // empty = full reset, valid
+        assert_eq!(parse_gc_body(&[0u8, 0, 0, 0, 0]).unwrap(), Vec::<u32>::new()); // empty = full reset, valid
         assert!(parse_gc_body(&[0u8, 0, 0, 0, 1, 0, 0, 0]).is_err()); // len mismatch (8 != 9)
         assert!(parse_gc_body(&[1u8, 0, 0, 0, 0]).is_err()); // bad flags
         // non-ascending is rejected
