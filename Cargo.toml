@@ -1,7 +1,19 @@
-[package]
-name = "aahl"
+[workspace]
+members = ["gui"]
+resolver = "2"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
+
+[profile.release]
+strip = true
+lto = true
+
+[package]
+name = "aahl"
+version.workspace = true
+edition.workspace = true
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

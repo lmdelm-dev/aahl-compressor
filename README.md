@@ -26,7 +26,8 @@ bytes -> chunk -> fold (recursive pair merging) -> symbols
   a pure function of archive bytes (snapshot lag is an encoder-only concept).
 - **v4 token model**: exact order-1 contexts for the 192 hottest grammar rules
   (format constants in docs/SPEC.md) plus deterministic cold hashing; v3
-  archives stay readable, and older readers reject v4 containers cleanly.- **No worse than raw**: an archive is never larger than the input. Chunks that
+  archives stay readable, and older readers reject v4 containers cleanly.
+- **No worse than raw**: an archive is never larger than the input. Chunks that
   resist all codecs fall back to STORE; whole incompressible inputs use the
   STORE container.
 
@@ -41,6 +42,7 @@ cargo build --release
 ```
 aahl create [OPTIONS] <ARCHIVE> <INPUTS>...
 aahl list   <ARCHIVE>
+aahl test   <ARCHIVE> [--json]
 aahl extract <ARCHIVE> <OUT_DIR>
 aahl corpus <SET_DIR> [--source DIR]
 aahl bench  <SET_DIR> [--tsv bench_results.tsv]
@@ -60,6 +62,28 @@ aahl blocksize <INPUT> [--sweep]
   (7-Zip deflate -mx=6), `7z9` (LZMA2 -mx=9), `xz -9`, `zstd -19`, and
   `rar` (WinRAR -m5), and writes a TSV of sizes and create/extract times.
 
+- `test` decodes every chunk in index order (through the persistent
+  grammar, applying interleaved GC records) and verifies hashes, lengths,
+  and per-file ref/length consistency. STORE containers are already fully
+  verified at open. Exits non-zero (and lists errors) on any corruption.
+- `--json` on `create`, `list`, and `test` prints a machine-readable
+  summary (files/chunks/bytes, index, or ok/errors).
+
+## GUI
+
+`aahl-gui` is a native desktop front-end (eframe/egui + rfd) that drives
+the `aahl` CLI as its engine:
+
+```
+cargo run -p aahl-gui          # development
+cargo build --release -p aahl-gui
+```
+
+It locates the engine in order: `AAHL_BIN` env var, then `aahl` on PATH,
+then a sibling `aahl` executable next to the GUI. It uses the wgpu
+backend (DX12/Vulkan) and includes a `Demo` toggle backed by a fake
+engine so the UI is usable without the CLI.
+
 ## Format
 
 Two containers share the footer:
@@ -67,7 +91,7 @@ Two containers share the footer:
 - **Compressed** (`AAHL` v3): header + params + recorded stream of DATA chunks
   and interleaved grammar-GC records, then the file table.
 - **STORE** (`AS` v2): raw concatenated payload with a per-file blake3 in the
-  table â€” used when the input is incompressible.
+  table — used when the input is incompressible.
 
 See `docs/SPEC.md` for the byte-level layout and `docs/DESIGN.md` for the
 grammar, GC, lag, and parallelism rationale.
