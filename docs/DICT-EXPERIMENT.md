@@ -49,22 +49,40 @@ pathological corpus cannot balloon the rule table.
 
 Benchmark (release build):
 
-    aahl train <dict.aahld> <corpus> --chunk-size 4096 --max-rules 3840
-        --min-benefit 1 --json
-    aahl bench-dict <corpus> <heldout> --dict <dict.aahld> --lanes aahl-nodict,
-        aahl-dict,zstd-nodict,zstd-dict --json
+    cargo build --release
+    ./target/release/aahl bench-dict <corpus_set> --chunk-size 65536 --runs 1
 
-Lanes measure archive bytes on the held-out samples given: (1) AAHL with no dict,
-(2) AAHL with the grammar dict, (3) zstd -19 baseline with no dict, (4) zstd with
-its trained dictionary. The two tools are NOT directly comparable in isolation
-(different chunking, folding, dedup) - what is compared is the DELTA each tool
-gets from its own dict, plus the absolute held-out bytes.
+Lanes measure archive bytes on a held-out 40% tail of each domain's stream
+given: (1) AAHL with no dict, (2) AAHL with the grammar dict, (3) zstd -19
+baseline with no dict, (4) zstd with its trained dictionary. Training uses the
+first ~60% of the stream, rounded down to whole chunks, so the two tools are
+measured on the SAME bytes (aahl chunk 65536; zstd blocks derived from the
+train length to keep >= 24 samples, see src/dictbench.rs). The two tools are
+NOT directly comparable in isolation (different chunking, folding, dedup) -
+what is compared is the DELTA each tool gets from its own dict, plus the
+absolute held-out bytes and the dict file size.
 
-Expected honest outcome (to be confirmed, see results below): AAHL dict gives the
-biggest absolute margin on highly self-similar corpora where the grammar can fold
-repeated piece derivations; zstd --train wins when the corpus is mostly unique
-high-entropy bytes where a learned flat prefix table still lands a few percent.
-The trailing run (V6 STEP 4 in ABLATION.md) records the actual numbers.
+Results (held-out archive bytes / ratio, dict file size):
+
+    domain  train     held-out   aahl-nodict  aahl-dict            zstd-nodict  zstd-dict
+    prose   786432    589497     172861      146817  (dict 3233B)  172820       165079  (dict 714KB)
+    table   5439488   3689353    616051      598703  (dict 6537B)  468090       464243  (dict 1.4MB)
+    code    262144    212146     75123       68560   (dict 6781B)  48169        44319   (dict 164KB)
+
+Small-file prefixes from the held-out tail (ratio at 1KiB/4KiB/16KiB/64KiB/
+100KiB) are in bench/dict-small.tsv; the dict margin grows as files shrink.
+
+Verdict: the AAHL dictionary is KEPT as opt-in capability, but as a *tie to
+inferior absolute ratio against zstd*, not a win. What it genuinely delivers:
+(1) the biggest relative gain vs its own no-dict baseline on every domain
+(prose -4.4pp: 0.2932 -> 0.2491, code -3.1pp: 0.3541 -> 0.3232, table -0.5pp:
+0.1670 -> 0.1623; zstd's own dict gains are 1.3pp / 1.8pp / 0.1pp), and (2) a
+dictionary 2-3 orders of magnitude smaller (3-7 KB vs 164 KB - 1.4 MB). On the
+prose domain AAHL's dict even passes zstd's absolute ratio once the stream
+grows (aahl-dict 0.2491 vs zstd-dict 0.2800). But zstd keeps a decisive
+absolute edge on table and code, which is where its entropy coder wins. The
+dict seam costs nothing on the default no-dict path (blake3 of a table archive
+is unchanged, f3682801..) and is therefore safe to ship as opt-in tooling.
 
 ## Fail-closed contract (why `--dict` can be trusted)
 
@@ -77,18 +95,22 @@ The trailing run (V6 STEP 4 in ABLATION.md) records the actual numbers.
 4. train on a corpus derives a rule table; create --dict writes the rule_hash
    record so extract can re-seed deterministically (rule_hash must match).
 
-Every one of these branches is exercised in the CLI smoke (work/ds*/ft.log) and in
-the dict unit tests under src (cargo test: each fail-closed path has a dedicated
-testhole).
+Every one of these branches is exercised by tests/dict_cli.rs (8 integration
+tests: roundtrip, no-dict, wrong-dict, plain+dict, corrupt-dict, no-dict
+determinism, dict determinism, dict determinism across -j) and the dict unit
+tests under src/dict.rs; each fail-closed path has a dedicated testhole and
+exits non-zero.
 
 ## Reproduce
 
     cargo build --release
-    ./target/release/aahl train work/d.d.aahld work/src 2>&1 | <json>
+    ./target/release/aahl train work/d.d.aahld work/src --json
     ./target/release/aahl create work/dc.aahl work/src --dict work/d.d.aahld
     ./target/release/aahl extract work/dc.aahl work/out --dict work/d.d.aahld
     ./target/release/aahl test   work/dc.aahl --dict work/d.d.aahld
+    cargo test --release --test dict_cli     # the fail-closed seam
+    ./target/release/aahl bench-dict corpus_set --chunk-size 65536 --runs 1
 
-Round-trip byte hashes are equal (SHA256 recorded in the smoke). Fail-closed
-branches all exit non-zero and write nothing.
+Round-trip byte hashes are equal. Fail-closed branches all exit non-zero and
+write nothing. Measured numbers: bench/dict-summary.tsv, bench/dict-small.tsv.
 

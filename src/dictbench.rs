@@ -188,9 +188,12 @@ fn zstd_lane(
         Ok(())
     })?;
     let (decompress_ms, _) = timed(|| {
-        let p = Command::new(zstd)
-            .arg("-d")
-            .arg("-c")
+        let mut cmd = Command::new(zstd);
+        cmd.arg("-d").arg("-c");
+        if let Some(d) = dictp {
+            cmd.arg("-D").arg(d);
+        }
+        let p = cmd
             .arg(&out)
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -262,12 +265,21 @@ pub fn run_dict_bench(
         dict::save(&aahld, &rep.rules, rep.sample_hash)?;
         let aahld_bytes = fs::metadata(&aahld).map(|m| m.len()).unwrap_or(0);
 
-        // zstd dictionary trained on the same stream.
+        // zstd dictionary trained on the same stream. zstd --train expects one
+        // sample per file (or -B to split a single file into block samples);
+        // our train stream is one concatenated file, so split it into blocks.
+        // zstd bails on too few samples, so target >= 24 blocks while never
+        // exceeding the aahl chunk size (a larger block would give zstd an
+        // unfair dictionary, tuned to more data than the aahl lane trains on).
+        let z_block = ((train_bytes / 24) as usize).clamp(4096, chunk_size);
         let zdict = dicts.join(format!("{name}.zdict"));
         run(
             &zstd,
             &[
                 "--train",
+                &format!("-B{z_block}"),
+                "--maxdict",
+                "1400000",
                 "-o",
                 zdict.to_string_lossy().as_ref(),
                 train.to_string_lossy().as_ref(),
