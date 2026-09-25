@@ -2,8 +2,9 @@
 //!
 //! Discovery order (first match wins):
 //!   1. `AAHL_BIN` environment variable (explicit path to the engine)
-//!   2. `aahl`/`aahl.exe` on PATH
-//!   3. sibling binary next to the GUI executable (`aahl` or `aahl.exe`)
+//!   2. a user-configured engine path (Settings)
+//!   3. `aahl`/`aahl.exe` on PATH
+//!   4. sibling binary next to the GUI executable (`aahl` or `aahl.exe`)
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -49,7 +50,41 @@ pub struct TestReportJson {
 }
 
 // ---------------------------------------------------------------------------
-// Engine discovery and runner
+// Create / extract options
+// ---------------------------------------------------------------------------
+
+/// Options forwarded to `aahl create`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateOptions {
+    pub chunk_size: u32,
+    pub jobs: u32,
+    pub lag: u32,
+    pub gc_interval: u32,
+    pub no_table: bool,
+    pub dict: Option<String>,
+}
+
+impl Default for CreateOptions {
+    fn default() -> Self {
+        Self {
+            chunk_size: 1_048_576,
+            jobs: 1,
+            lag: 16,
+            gc_interval: 64,
+            no_table: false,
+            dict: None,
+        }
+    }
+}
+
+/// Options forwarded to `aahl extract`.
+#[derive(Debug, Clone, Default)]
+pub struct ExtractOptions {
+    pub dict: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Engine abstraction
 // ---------------------------------------------------------------------------
 
 /// Abstraction over the aahl engine so tests can substitute a fake.
@@ -60,8 +95,10 @@ pub trait Engine {
     fn list(&self, archive: &Path) -> Result<ListInfoJson>;
     /// `aahl test --json ARCHIVE` (non-zero exit is reported as ok:false)
     fn test(&self, archive: &Path) -> Result<TestReportJson>;
-    /// `aahl create --json ARCHIVE INPUT...`
-    fn create(&self, archive: &Path, inputs: &[PathBuf]) -> Result<CreateInfoJson>;
+    /// `aahl create --json [opts] ARCHIVE INPUT...`
+    fn create(&self, archive: &Path, inputs: &[PathBuf], opts: &CreateOptions) -> Result<CreateInfoJson>;
+    /// `aahl extract [opts] ARCHIVE OUT_DIR` (no --json support in the engine)
+    fn extract(&self, archive: &Path, out_dir: &Path, opts: &ExtractOptions) -> Result<()>;
 }
 
 /// The real engine: spawns the `aahl` CLI executable.
@@ -98,7 +135,17 @@ impl CliEngine {
         Ok(CliEngine { bin: found })
     }
 
-    fn run_json<T: serde::de::DeserializeOwned>(&self, args: &[&str]) -> Result<T> {
+    /// Engine from an explicit (user-configured) binary path.
+    pub fn from_path(bin: PathBuf) -> CliEngine {
+        CliEngine { bin }
+    }
+
+    /// The resolved engine binary path.
+    pub fn bin(&self) -> &Path {
+        &self.bin
+    }
+
+    fn run_json<T: serde::de::DeserializeOwned>(&self, args: &[String]) -> Result<T> {
         let out = Command::new(&self.bin)
             .args(args)
             .output()
@@ -116,25 +163,77 @@ impl CliEngine {
     }
 }
 
+fn s(p: &Path) -> String {
+    p.to_string_lossy().into_owned()
+}
+
 impl Engine for CliEngine {
     fn label(&self) -> String {
         self.bin.display().to_string()
     }
 
     fn list(&self, archive: &Path) -> Result<ListInfoJson> {
-        self.run_json(&["list", "--json", archive.to_str().unwrap()])
+        self.run_json(&["list".into(), "--json".into(), s(archive)])
     }
 
     fn test(&self, archive: &Path) -> Result<TestReportJson> {
-        self.run_json(&["test", "--json", archive.to_str().unwrap()])
+        let args = vec!["test".into(), "--json".into(), s(archive)];
+        // test on a dict-seeded archive requires the dict to be supplied
+        // (handled by the caller via ExtractOptions-compatible dict passthrough)
+        self.run_json(&args)
     }
 
-    fn create(&self, archive: &Path, inputs: &[PathBuf]) -> Result<CreateInfoJson> {
-        let mut args = vec!["create", "--json", archive.to_str().unwrap()];
+    fn create(&self, archive: &Path, inputs: &[PathBuf], opts: &CreateOptions) -> Result<CreateInfoJson> {
+        let mut args: Vec<String> = vec![
+            "create".into(),
+            "--json".into(),
+            "--chunk-size".into(),
+            opts.chunk_size.to_string(),
+            "-j".into(),
+            opts.jobs.to_string(),
+            "--lag".into(),
+            opts.lag.to_string(),
+            "--gc-interval".into(),
+            opts.gc_interval.to_string(),
+        ];
+        if opts.no_table {
+            args.push("--no-table".into());
+        }
+        if let Some(d) = &opts.dict {
+            args.push("--dict".into());
+            args.push(d.clone());
+        }
+        args.push(s(archive));
         for i in inputs {
-            args.push(i.to_str().unwrap());
+            args.push(s(i));
         }
         self.run_json(&args)
+    }
+
+    fn extract(&self, archive: &Path, out_dir: &Path, opts: &ExtractOptions) -> Result<()> {
+        let mut args: Vec<String> = vec!["extract".into()];
+        if let Some(d) = &opts.dict {
+            args.push("--dict".into());
+            args.push(d.clone());
+        }
+        args.push(s(archive));
+        args.push(s(out_dir));
+        // ensure the target directory exists so `create_dir_all` semantics hold
+        std::fs::create_dir_all(out_dir)
+            .with_context(|| format!("failed to create {}", out_dir.display()))?;
+        let out = Command::new(&self.bin)
+            .args(&args)
+            .output()
+            .with_context(|| format!("failed to execute {}", self.bin.display()))?;
+        if !out.status.success() {
+            bail!(
+                "aahl {} failed ({})\n{}",
+                args.join(" "),
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        Ok(())
     }
 }
 
@@ -174,7 +273,7 @@ impl Engine for FakeEngine {
         })
     }
 
-    fn create(&self, _archive: &Path, inputs: &[PathBuf]) -> Result<CreateInfoJson> {
+    fn create(&self, _archive: &Path, inputs: &[PathBuf], _opts: &CreateOptions) -> Result<CreateInfoJson> {
         Ok(CreateInfoJson {
             files: inputs.len(),
             unique_chunks: inputs.len(),
@@ -182,6 +281,11 @@ impl Engine for FakeEngine {
             archive_bytes: 4_384,
             store: false,
         })
+    }
+
+    fn extract(&self, _archive: &Path, out_dir: &Path, _opts: &ExtractOptions) -> Result<()> {
+        std::fs::create_dir_all(out_dir)?;
+        Ok(())
     }
 }
 
@@ -216,9 +320,19 @@ mod tests {
     fn fake_create_counts_inputs() {
         let f = FakeEngine;
         let c = f
-            .create(Path::new("o.aahl"), &[PathBuf::from("a.txt"), PathBuf::from("b.txt")])
+            .create(Path::new("o.aahl"), &[PathBuf::from("a.txt"), PathBuf::from("b.txt")], &CreateOptions::default())
             .unwrap();
         assert_eq!(c.files, 2);
+    }
+
+    #[test]
+    fn fake_extract_creates_out_dir() {
+        let f = FakeEngine;
+        let tmp = std::env::temp_dir().join(format!("aahl-gui-fake-extract-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        f.extract(Path::new("x.aahl"), &tmp, &ExtractOptions::default()).unwrap();
+        assert!(tmp.is_dir());
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
