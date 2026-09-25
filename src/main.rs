@@ -4,6 +4,8 @@ mod arith;
 mod bench;
 mod binning;
 mod corpus;
+mod context;
+mod contextbench;
 mod dict;
 mod dictbench;
 mod grammar;
@@ -235,6 +237,20 @@ enum Cmd {
         table_log2: u32,
         #[arg(long, help = "skip the token-stream modes (fold is the expensive part)")]
         no_tokens: bool,
+    },
+    /// Measure the isolated context-conditioned codec against shipped block modes
+    #[command(name = "bench-ctx")]
+    RunBenchCtx {
+        /// files or directories to measure
+        inputs: Vec<PathBuf>,
+        #[arg(long, default_value_t = 1, help = "timed repetitions per chunk")]
+        runs: usize,
+        #[arg(long, default_value = "bench/ctx-runs.tsv", help = "write per-run rows to this TSV")]
+        runs_tsv: PathBuf,
+        #[arg(long, default_value = "bench/ctx-summary.tsv", help = "write the summary table to this TSV")]
+        summary_tsv: PathBuf,
+        #[arg(long, default_value_t = 1_048_576, help = "chunk size in bytes")]
+        chunk_size: usize,
     },
     /// Train a grammar dictionary from sample files/directories (V6 STEP 4)
     #[command(name = "train")]
@@ -1942,6 +1958,22 @@ fn main() -> Result<()> {
                 no_tokens,
             };
             ansbench::run_ans_bench(&inputs, &opts)?;
+            Ok(())
+        }
+        Cmd::RunBenchCtx {
+            inputs,
+            runs,
+            runs_tsv,
+            summary_tsv,
+            chunk_size,
+        } => {
+            let opts = contextbench::Options {
+                runs,
+                chunk_size,
+                runs_tsv,
+                summary_tsv,
+            };
+            contextbench::run_context_bench(&inputs, &opts)?;
             Ok(())
         }
         Cmd::Train {

@@ -223,3 +223,46 @@ Pre-existing unrelated warnings unchanged.
       table : aahl-dict 0.1623 (dict 6.5KB)  | zstd-dict 0.1258 (dict 1.4MB)
       code  : aahl-dict 0.3232 (dict 6.8KB)  | zstd-dict 0.2089 (dict 164KB)
     **KEPT (capability, at most a tie vs zstd)**: aahl-dict wins the biggest RELATIVE gain vs its own no-dict baseline (prose -4.4pp, code -3.1pp, table -0.5pp; zstd's own dict gains are 1.3pp/1.8pp/0.1pp) and needs a dictionary 2-3 orders of magnitude smaller (3-7KB vs 164KB-1.4MB), but zstd keeps a decisive absolute edge on table/code. Verdict: dict seam is genuinely useful for the small-archive/many-archives case and costs nothing on the default path, so it STAYS as opt-in tooling; it does not change the aahl default ratio story. (see docs/DICT-EXPERIMENT.md + bench/dict-summary.tsv, bench/dict-small.tsv).
+
+# V6 STEP 5: context-conditioned folded-token codec — decision record
+
+Harness: `aahl bench-ctx` over the deterministic corpus set with 65,536-byte
+chunks and three context repetitions. Full methodology, frame details, TSV
+schemas, limitations, and raw commands are in `docs/CONTEXT-EXPERIMENT.md`.
+The committed outputs are `bench/ctx-runs.tsv` (1,603 rows) and
+`bench/ctx-summary.tsv` (115 rows); all rows have `ok=1`.
+
+## Complete-size results
+
+| group | raw | fold | order0 | order1_tok | order1_byte | context |
+|---|---:|---:|---:|---:|---:|---:|
+| all 23 files | 14,149,354 | 6,060,949 | 5,896,239 | 6,527,149 | 7,445,710 | 6,604,904 |
+| non-`src` | 13,650,536 | 5,867,423 | 5,714,880 | 6,342,585 | 7,189,171 | 6,417,906 |
+| `src` | 498,818 | 193,526 | 181,359 | 184,564 | 256,539 | 186,998 |
+
+| group | context vs fold | context vs order0 | context vs order1_tok |
+|---|---:|---:|---:|
+| all 23 files | +543,955 (+8.9747%) | +708,665 (+12.0189%) | +77,755 (+1.1913%) |
+| non-`src` | +550,483 (+9.3820%) | +703,026 (+12.3017%) | +75,321 (+1.1878%) |
+| `src` | -6,528 (-3.3732%) | +5,639 (+3.1093%) | +2,434 (+1.3188%) |
+
+## Decision
+
+- **REJECTED: archive adoption.** The context model loses to fold by 8.97%
+  and to order-1 token coding by 1.19% over the complete corpus. Random and
+  precompressed inputs lose by approximately 15.5%; the source subgroup is a
+  modest exception but does not justify a new block tag or format obligation.
+- **KEPT: isolated capability and benchmark.** The codec remains available for
+  future remeasurement, with no changes to `compress_block`, block tags, or
+  archive dispatch. The default archive remains byte-identical; compatibility
+  verification reproduced BLAKE3
+  `f368280196eef73b15cc9d763c6f029fc2583eeb5fccd975ee10bf8e14bfe2d0`.
+- **Accounting note:** `model_bytes=0` means no serialized model/table; in-memory
+  adaptive-model RAM is not part of this wire-size comparison. Baseline timing
+  fields are zero because those modes use size-only measurement calls; only the
+  context lane is timed.
+
+## Verification
+
+Context unit tests pass. Release validation passed with 141 library/unit tests
+and 8 dictionary CLI tests. The codec is not wired into the shipping path.

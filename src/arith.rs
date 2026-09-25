@@ -37,7 +37,7 @@ self.cache_size += 1;
         self.low = (((self.low as u32) << 8) & 0xFFFF_FFFF) as u64;
     }
 
-    fn encode_step(&mut self, start: u64, size: u64, total: u64) {
+    pub(crate) fn encode_step(&mut self, start: u64, size: u64, total: u64) {
         debug_assert!(total > 0 && size > 0 && start + size <= total);
         self.range /= total;
         self.low += start * self.range;
