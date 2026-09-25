@@ -279,3 +279,58 @@ the best base-zero lane changes the 32-file selected total by only -82 bytes
 160 bytes of replay markers. The isolated transform and `aahl bench-bcj` tool
 are retained outside `compress_block`; the default archive remains
 byte-identical.
+
+# V6 final report — six measured codec experiments
+
+Every experiment is a real implementation with a real benchmark (no synthetic
+claims), gated on the same rules: std-only, byte-deterministic, decoder never
+panics, no `Cargo.toml` changes, detection (RAEN) thumbs-up, verdict written
+down before moving on, and the default container path left byte-identical.
+Commit chain: `54d5522` (baseline) -> `283569e` (parallelism) -> `fe49f67`
+(tANS) -> `91f1b6e`+`dfa9138` (seed dict) -> `3e079f7` (context) -> `fc1ab5e`
+(BCJ).
+
+## Per-step verdicts
+
+| step | what | verdict | decisive numbers |
+|------|------|---------|------------------|
+| 0 (pre-V6) | rule-context baseline + decoder stall fix | KEPT (RULE_CTX=8; stall fix kept, a real fuzz bug) | RULE_CTX=16 win is 0.08% aggregate, concentrated at non-default 4096 chunk, loses at 262144; corrupt-input hang fixed in `arith.rs` renorm (`range=0` spin) |
+| 1 | v4/v5 baseline reproduction, determinism, oracle, bench reconciliation | KEPT as harness truth | `f3682801..e2d0` table blake3 established; grammar == stateless best off-table |
+| 2 | thread parallelism (`-j 1/2/4/8`) | KEPT for determinism, REJECTED for speed | byte-identical across jobs; no wall-clock speedup (oracle-bound) |
+| 3 | tANS/FSE entropy backend | REJECTED (token mode); KEPT out-of-container (literal mode) + `aahl ans-bench` | payload win on table.csv −0.02% is fully consumed by 4-byte/symbol frequency tables → +1.9..+3.6% complete cost; literal mode −0.11% deterministic but not worth a block tag |
+| 4 | grammar-seeded dictionary (`train/create/extract/test --dict`) | KEPT as opt-in capability (at most a tie vs zstd) | prose −4.4pp relative gain w/ 3.2KB dict vs zstd's 714KB; zstd keeps absolute edge on table/code (0.1258/0.2089 vs 0.1623/0.3232) |
+| 5 | context-conditioned folded-token codec | REJECTED for archive; KEPT as isolated tooling | +8.97% vs fold, +1.19% vs order-1 token over 23 files; −15.5% on random/precompressed |
+| 6 | x86 BCJ branch/call filter | REJECTED for archive; KEPT as isolated tooling | best lane −0.0008% total, regresses 3/4 classes; xz −48%, zstd −30% on executable class |
+
+## What shipped (V6 summary)
+
+- **The archive format did not change in any step**: same block tags, same 1 MiB
+  default chunking, same byte-for-byte output. The table-corpus create path
+  reproduces blake3
+  `f368280196eef73b15cc9d763c6f029fc2583eeb5fccd975ee10bf8e14bfe2d0`
+  (1,538,846 B from 9,128,841 B raw) after every experiment.
+- **Three permanent fixes found by measuring honestly**: the decoder-stall
+  hang (fuzz, step 0), the truncated dict_cli test stub and unrun bench-dict
+  harness (zstd `-B` splice + missing `-D`) in step 4, and two byte-identity
+  checks in steps 5/6. The "try a codec, see what happens" loop caught real
+  defects that a green test suite had been hiding.
+- **Reusable tooling kept in-tree** (all outside `compress_block`): `aahl
+  ans-bench`, `aahl bench-dict`, `aahl bench-ctx`, `aahl bench-bcj`, plus the
+  isolated codecs (`tans.rs`, `context.rs`, `bcj.rs`) and `dict.rs` seam for
+  remeasurement before any future format decision.
+- **Determinism is the architectural constraint that shaped V6**: byte-identical
+  output across `-j 1/2/4/8`, order-independent corpus sampling, and per-chunk
+  integrity hashes are asserted by tests at every step; the parallelism step
+  confirmed determinism holds and that the oracle (and not entropy coding) is
+  the throughput ceiling.
+- **Where the ratio really comes from**: the pre-V6 grammar + measured table
+  transform (v5, `1,673,892 -> 1,538,846` on table at 1 MiB, `docs/ABLATION.md`
+  Phase B) — none of the six V6 codec experiments moved the default-ratio story;
+  their combined honest contribution to the shipping path is the fixes listed
+  above plus documented, re-runnable rejection evidence.
+- **Known ceiling**: the shipped entropy backend (adaptive order-0 arithmetic +
+  order-1 byte + fold grammar) is within ~1-2% of tANS literal on compressible
+  corpora with a wall-clock decode advantage; xz/zstd still beat aahl by 30-48%
+  on the executable-class corpus (BCJ lane, above), which is consistent with
+  aahl's design center: grammar/packing wins on table-like streams, not on
+  already-LZ-optimal binary code. No V6 result changed that positioning.
