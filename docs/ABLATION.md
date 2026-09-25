@@ -166,3 +166,53 @@ chunk whose oracle-selected transform is emitted as the wrapped T stream
 - **INCONCLUSIVE**: `DMODE_DATE` (day-number encoding). Fired on zero
   real-world rows (no date columns in the synthetic set); unit-tested, kept
   off by default (`DMODE_NONE` for non-numeric, non-monotonic columns).
+
+# V6 STEP 3: tANS/FSE entropy backend - decision record
+
+Harness: `aahl ans-bench corpus_set\table\table.csv corpus_set\text-large\large.txt corpus_set\random\random.bin corpus_set\precompressed\in.bin corpus_set\precompressed\z.zst --recut --runs 3 --runs-tsv bench\ans-runs.tsv --summary-tsv bench\ans-summary.tsv` (225 rows, all ok=1, deterministic).
+Codec + methodology + full numbers: see `docs/ANS-EXPERIMENT.md`.
+
+| corpus       | mode  | arith bytes | tANS bytes | delta bytes | delta % | decision |
+|--------------|-------|-------------|------------|-------------|---------|----------|
+| table.csv    | lit   | 15,937,308  | 15,919,251 | -18,057     | -0.1133 | win      |
+| table.csv    | recut | 4,614,765   | 4,603,218  | -11,547     | -0.2502 | win      |
+| table.csv    | tok   | 5,055,351   | 5,152,851  | +97,500     | +1.9286 | lose     |
+| large.txt    | lit   | 2,264,814   | 2,264,118  | -696        | -0.0307 | marginal |
+| large.txt    | recut | 974,412     | 979,431    | +5,019      | +0.5151 | lose     |
+| large.txt    | tok   | 974,412     | 994,137    | +19,725     | +2.0243 | lose     |
+| random.bin   | lit   | 3,146,739   | 3,148,842  | +2,103      | +0.0668 | lose     |
+| random.bin   | recut | 3,145,746   | 3,148,842  | +3,096      | +0.0984 | lose     |
+| random.bin   | tok   | 3,169,068   | 3,282,819  | +113,751    | +3.5894 | lose     |
+| precompressed (in.bin + z.zst) | tok | 6,338,301 | 6,566,124 | +227,823  | +3.5944 | lose     |
+
+## Decisions
+
+- **REJECTED: tANS token mode** as an entropy backend. On table.csv the tANS
+  payload is actually 0.02% smaller than arith's, but the per-block frequency
+  table (4 bytes per used symbol; folded alphabets run 919-1280 symbols) is
+  ~20x larger than that gain, so complete cost is +1.9%..+3.6% on every
+  corpus. A payload win that disappears entirely when the table is counted is
+  rejected by the STEP-3 decision rule as written.
+- **KEPT (out-of-container, measured-capability only): tANS literal mode** -
+  deterministic complete-cost wins on compressible corpora at the default
+  1 MiB chunk (table.csv -18,057 B / -0.11%, large.txt -0.03%), losses
+  limited to +0.07%..+0.11% on random/precompressed. Codec is fully isolated
+  in `src/tans.rs` (10 unit tests + normalization regression, self-contained
+  block format, decoder never panics) and is NOT wired into any block tag, so
+  the archive format is byte-for-byte unchanged (create blake3 reproduced:
+  f368280196eef73b15cc9d763c6f029fc2583eeb5fccd975ee10bf8e14bfe2d0; test
+  suite 118 -> 129). Format adoption would require a new block tag +
+  writer/reader agreement for at most -0.25%; same reasoning that rejected
+  RULE_CTX=16 (ABLATION.md) applies: margin too small to justify a format
+  break, so tANS stays out of the container.
+- **KEPT (tooling): `aahl ans-bench`** stays in the tree so format work can
+  re-measure before committing to a tag; both TSVs are committed.
+- **Decode speed note (non-decision)**: tANS decodes literals 3-5x faster
+  (13-15 ms vs 50-64 ms per 1 MiB) but encodes ~1.3-1.6x slower; not a
+  format driver.
+
+## Test suite delta (this commit)
+118 -> 129 tests (10 tans codec tests, 1 ansbench harness test, folded
+normalization regression inside `normalization_properties`). All byte-
+determinism, corruption-rejection, round-trip, legacy-read tests still green.
+Pre-existing unrelated warnings unchanged.

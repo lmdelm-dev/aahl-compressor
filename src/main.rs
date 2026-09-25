@@ -7,6 +7,8 @@ mod corpus;
 mod grammar;
 mod spectral;
 mod table;
+mod tans;
+mod ansbench;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use std::collections::HashMap;
@@ -198,6 +200,26 @@ enum Cmd {
             help = "comma-separated chunk sizes to measure"
         )]
         chunk_sizes: Vec<usize>,
+    },
+    /// Experimental tANS/FSE entropy backend comparison (isolated; no format change)
+    #[command(name = "ans-bench")]
+    RunAnsBench {
+        /// files to measure (precompressed corpus = pass both files)
+        inputs: Vec<PathBuf>,
+        #[arg(long, default_value_t = 3, help = "timed repetitions per chunk/mode")]
+        runs: usize,
+        #[arg(long, help = "also recut the real default-path inner blocks with tANS")]
+        recut: bool,
+        #[arg(long, default_value = "bench/ans-runs.tsv", help = "write per-run rows to this TSV")]
+        runs_tsv: PathBuf,
+        #[arg(long, default_value = "bench/ans-summary.tsv", help = "write the summary table to this TSV")]
+        summary_tsv: PathBuf,
+        #[arg(long, default_value_t = 1_048_576, help = "chunk size in bytes")]
+        chunk_size: usize,
+        #[arg(long, default_value_t = 12, help = "tANS table exponent K (7..=12)")]
+        table_log2: u32,
+        #[arg(long, help = "skip the token-stream modes (fold is the expensive part)")]
+        no_tokens: bool,
     },
 }
 
@@ -1699,6 +1721,28 @@ fn main() -> Result<()> {
         }
                 Cmd::RunAblate { set_dir, tsv, chunk_sizes } => {
             ablation::run_ablation(&set_dir, &tsv, &chunk_sizes)?;
+            Ok(())
+        }
+        Cmd::RunAnsBench {
+            inputs,
+            runs,
+            recut,
+            runs_tsv,
+            summary_tsv,
+            chunk_size,
+            table_log2,
+            no_tokens,
+        } => {
+            let opts = ansbench::Options {
+                runs,
+                recut,
+                runs_tsv,
+                summary_tsv,
+                chunk_size,
+                table_log2,
+                no_tokens,
+            };
+            ansbench::run_ans_bench(&inputs, &opts)?;
             Ok(())
         }
     }
