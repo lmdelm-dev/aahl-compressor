@@ -266,3 +266,16 @@ The committed outputs are `bench/ctx-runs.tsv` (1,603 rows) and
 
 Context unit tests pass. Release validation passed with 141 library/unit tests
 and 8 dictionary CLI tests. The codec is not wired into the shipping path.
+
+[x] V6 STEP 6 **isolated x86 BCJ branch/call filter** — reversible `E8`, `E9`,
+and near-Jcc transform with base-zero, x86, and x64 lanes, strict truncation
+errors, terminal-chunk adapters, deterministic corpus sampling, per-file
+five-byte replay accounting, inverse checks, repeated-run determinism checks,
+and optional x86-filtered xz/zstd reference lanes. Full results are in
+`docs/BCJ-EXPERIMENT.md`, `bench/bcj-runs.tsv` (448 rows), and
+`bench/bcj-summary.tsv` (all rows `ok=1`). **REJECTED for archive adoption:**
+the best base-zero lane changes the 32-file selected total by only -82 bytes
+(-0.0008%), regresses on archive, cold-image, and installer classes, and adds
+160 bytes of replay markers. The isolated transform and `aahl bench-bcj` tool
+are retained outside `compress_block`; the default archive remains
+byte-identical.

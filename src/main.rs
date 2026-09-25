@@ -1,6 +1,8 @@
 ﻿mod aahl;
 mod ablation;
 mod arith;
+mod bcj;
+mod bcjbench;
 mod bench;
 mod binning;
 mod corpus;
@@ -251,6 +253,23 @@ enum Cmd {
         summary_tsv: PathBuf,
         #[arg(long, default_value_t = 1_048_576, help = "chunk size in bytes")]
         chunk_size: usize,
+    },
+    #[command(name = "bench-bcj", about = "Measure the isolated x86 BCJ transform against raw AAHL blocks (V6 STEP 6)")]
+    RunBenchBcj {
+        #[arg(default_value = "corpus_bin", help = "corpus_bin directory containing manifest.tsv")]
+        corpus_root: PathBuf,
+        #[arg(long, default_value_t = 3, help = "timed repetitions per file/lane")]
+        runs: usize,
+        #[arg(long, default_value = "bench/bcj-runs.tsv", help = "write per-run rows to this TSV")]
+        runs_tsv: PathBuf,
+        #[arg(long, default_value = "bench/bcj-summary.tsv", help = "write the summary table to this TSV")]
+        summary_tsv: PathBuf,
+        #[arg(long, default_value_t = 1_048_576, help = "AAHL and BCJ chunk size in bytes")]
+        chunk_size: usize,
+        #[arg(long, default_value_t = 8, help = "deterministic maximum files sampled per class")]
+        max_files_per_class: usize,
+        #[arg(long, help = "omit the xz and zstd x86-filter reference lanes")]
+        no_references: bool,
     },
     /// Train a grammar dictionary from sample files/directories (V6 STEP 4)
     #[command(name = "train")]
@@ -1974,6 +1993,26 @@ fn main() -> Result<()> {
                 summary_tsv,
             };
             contextbench::run_context_bench(&inputs, &opts)?;
+            Ok(())
+        }
+        Cmd::RunBenchBcj {
+            corpus_root,
+            runs,
+            runs_tsv,
+            summary_tsv,
+            chunk_size,
+            max_files_per_class,
+            no_references,
+        } => {
+            let opts = bcjbench::Options {
+                runs,
+                chunk_size,
+                max_files_per_class,
+                runs_tsv,
+                summary_tsv,
+                with_references: !no_references,
+            };
+            bcjbench::run_bcj_bench(&corpus_root, &opts)?;
             Ok(())
         }
         Cmd::Train {
