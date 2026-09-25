@@ -1,9 +1,11 @@
-mod aahl;
+﻿mod aahl;
 mod ablation;
 mod arith;
 mod bench;
 mod binning;
 mod corpus;
+mod dict;
+mod dictbench;
 mod grammar;
 mod spectral;
 mod table;
@@ -44,6 +46,9 @@ const RECORD_DATA: u8 = 0x01; // body = blake3[32] | unpacked_len u32 | packed b
 const RECORD_GC: u8 = 0x02; // body = flags u8 | num_survivors u32 | survivor u32* (grammar GC)
 const STORE_VERSION: u16 = 2; // v2: per-file blake3 hash in the table
 const STORE_MODE: u16 = 0; // single raw container, no grammar
+const FLAG_DICT: u16 = 0x0010; // v6: dict-seeded grammar (RECORD_DICT before first DATA record)
+const RECORD_DICT: u8 = 0x03; // body = dict rule_hash blake3[32] | num_rules u32
+const STORE_MODE_DICT: u16 = 1; // STORE with dict marker at offset 6..42 (rule_hash[32] | num_rules u32)
 
 #[derive(Parser)]
 #[command(name = "aahl", version, about = "AAHL - grammar-folding archive (no LZ/zstd)")]
@@ -73,6 +78,10 @@ enum Cmd {
         /// commits stay serial, so any -j produces byte-identical archives.
         #[arg(long, short, default_value_t = 1)]
         jobs: usize,
+        /// Seed the grammar from a trained dictionary (see `aahl train`); the
+        /// archive then fails closed unless the same dict is given at extract/test.
+        #[arg(long, value_name = "DICT", help = "seed the grammar from a trained dictionary (.aahld)")]
+        dict: Option<PathBuf>,
         /// Diagnostics (measurement-gate only): write parallel-encoder counters
         /// (tasks spawned, used/stale discovery, falls-back, time split, peak
         /// workers) to FILE. Requires -j > 1 to be meaningful; archive bytes are
@@ -107,6 +116,9 @@ enum Cmd {
         /// Emit a machine-readable JSON report
         #[arg(long)]
         json: bool,
+        /// Dictionary required by a dict-seeded archive
+        #[arg(long, value_name = "DICT")]
+        dict: Option<PathBuf>,
     },
     /// Extract archive
     Extract {
@@ -114,6 +126,9 @@ enum Cmd {
         archive: PathBuf,
         #[arg(value_name = "OUT_DIR", help = "target directory (created if absent)")]
         out_dir: PathBuf,
+        /// Dictionary required by a dict-seeded archive
+        #[arg(long, value_name = "DICT")]
+        dict: Option<PathBuf>,
     },
     /// Report per-mode block sizes for a single file (dev/diagnostic)
     #[command(name = "blocksize")]
@@ -220,6 +235,35 @@ enum Cmd {
         table_log2: u32,
         #[arg(long, help = "skip the token-stream modes (fold is the expensive part)")]
         no_tokens: bool,
+    },
+    /// Train a grammar dictionary from sample files/directories (V6 STEP 4)
+    #[command(name = "train")]
+    Train {
+        #[arg(value_name = "OUT_DICT", help = "output .aahld dictionary file")]
+        out_dict: PathBuf,
+        #[arg(value_name = "SAMPLES", help = "sample files and/or directories to train on")]
+        samples: Vec<PathBuf>,
+        #[arg(long, default_value_t = 65536, help = "training chunk size in bytes (4KiB..1MiB)")]
+        chunk_size: usize,
+        #[arg(long, default_value_t = 3840, help = "maximum dict rules (<= 3840)")]
+        max_rules: usize,
+        #[arg(long, default_value_t = 1, help = "drop rules with benefit < this (0 = keep all trained)")]
+        min_benefit: i64,
+        #[arg(long, help = "emit a machine-readable JSON summary")]
+        json: bool,
+    },
+    /// Measure dictionary compression vs zstd trained dictionaries (V6 STEP 4)
+    #[command(name = "bench-dict")]
+    RunBenchDict {
+        set_dir: PathBuf,
+        #[arg(long, default_value = "bench/dict-summary.tsv", help = "per-domain summary TSV")]
+        tsv: PathBuf,
+        #[arg(long, default_value = "bench/dict-small.tsv", help = "small-prefix TSV")]
+        small_tsv: PathBuf,
+        #[arg(long, default_value_t = 1_048_576, help = "chunk size in bytes for the aahl lane")]
+        chunk_size: usize,
+        #[arg(long, default_value_t = 1, help = "timing repetitions (median, min 1)")]
+        runs: usize,
     },
 }
 
@@ -354,7 +398,7 @@ fn cmd_create(
     gc_interval: usize,
     jobs: usize,
 ) -> Result<()> {
-    cmd_create_par(archive, inputs, chunk_size, lag, gc_interval, jobs, None, false, None, false)
+    cmd_create_par(archive, inputs, chunk_size, lag, gc_interval, jobs, None, None, false, None, false)
 }
 
 /// CLI create entry: validation plus optional Phase A2 parallel diagnostics.
@@ -365,6 +409,7 @@ fn cmd_create_par(
     lag: usize,
     gc_interval: usize,
     jobs: usize,
+    dict_path: Option<&Path>,
     par_stats: Option<&Path>,
     no_table: bool,
     table_stats: Option<&Path>,
@@ -378,6 +423,10 @@ fn cmd_create_par(
     }
     let mut stats = ParStats::default();
     let mut tstats = table::TableStats::default();
+    let loaded_dict = match dict_path {
+        Some(p) => Some(dict::load(p)?),
+        None => None,
+    };
     let version = if no_table { 4 } else { VERSION };
     let res = cmd_create_params_version_impl(
         archive,
@@ -388,6 +437,7 @@ fn cmd_create_par(
         version,
         if par_stats.is_some() { Some(&mut stats) } else { None },
         if version >= 5 && table_stats.is_some() { Some(&mut tstats) } else { None },
+        loaded_dict.as_ref(),
     );
     if let Some(p) = par_stats {
         if jobs <= 1 {
@@ -440,7 +490,7 @@ fn cmd_create_params(
     params: u64,
     jobs: usize,
 ) -> Result<CreateInfoJson> {
-    cmd_create_params_version(archive, inputs, chunk_size, params, jobs, VERSION)
+    cmd_create_params_version(archive, inputs, chunk_size, params, jobs, VERSION, None)
 }
 
 /// Full create path with an explicit container version. Production writes
@@ -454,8 +504,9 @@ fn cmd_create_params_version(
     params: u64,
     jobs: usize,
     version: u16,
+    dict: Option<&dict::Dict>,
 ) -> Result<CreateInfoJson> {
-    cmd_create_params_version_impl(archive, inputs, chunk_size, params, jobs, version, None, None)
+    cmd_create_params_version_impl(archive, inputs, chunk_size, params, jobs, version, None, None, dict)
 }
 
 /// Full create path with explicit params and an optional Phase A2 diagnostics
@@ -470,6 +521,7 @@ fn cmd_create_params_version_impl(
     version: u16,
     par_stats: Option<&mut ParStats>,
     mut table_stats: Option<&mut table::TableStats>,
+    dict: Option<&dict::Dict>,
 ) -> Result<CreateInfoJson> {
     if !(4096..=1_048_576).contains(&chunk_size) {
         bail!("chunk-size must be 4KiB..1MiB (fold is O(n*m), keep small)");
@@ -486,11 +538,24 @@ fn cmd_create_params_version_impl(
     if use_table {
         flags |= FLAG_TABLE;
     }
+    if dict.is_some() {
+        flags |= FLAG_DICT;
+    }
     prefix[6..8].copy_from_slice(&flags.to_le_bytes());
     prefix[8..12].copy_from_slice(&chunk_size.to_le_bytes());
     prefix[12..20].copy_from_slice(&params.to_le_bytes());
     out.write_all(&prefix)?;
     write_u16(&mut out, header_checksum(&prefix))?; // HEADER_LEN_V3 == 22
+
+    // V6: dictionary marker before the first DATA record. Both sides load the
+    // same rule table, so definitions are never retransmitted. Fails closed:
+    // extract/test must pass the same --dict (.aahld) file.
+    if let Some(d) = dict {
+        out.write_all(&[RECORD_DICT])?;
+        write_u32(&mut out, 36)?; // RECORD_DICT body_len = rule_hash[32] + n_rules u32
+        out.write_all(&d.rule_hash)?;
+        write_u32(&mut out, d.rules.len() as u32)?;
+    }
 
     // Buffer the unique pieces (with their first-seen order) so discovery can
     // run ahead of commit. Dedup runs while gathering: repeated pieces are refs
@@ -557,6 +622,12 @@ fn cmd_create_params_version_impl(
         )
     };
 
+    // V6: encoder and decoder seed the same dictionary table first, so the
+    // archive never retransmits the definitions.
+    if let Some(d) = dict {
+        grammar.seed_rules(&d.rules)?;
+    }
+
     // Emit every unique chunk in first-seen order. With jobs <= 1 (or lag <= 1)
     // discovery and commit share the serial path; with lag > 1 and jobs > 1 a
     // bounded pipeline runs pure discovery ahead of a strictly serial commit,
@@ -597,7 +668,7 @@ fn cmd_create_params_version_impl(
     // STORE alternative: raw payload + 6B container + entry table + footer.
     // Equal widths stay compressed; strictly smaller switches to STORE so the
     // archive is never worse than raw (+6B header, table stated honestly).
-    let store_total: u64 = 6
+    let store_total: u64 = if dict.is_some() { 42 } else { 6 }
         + 8
         + raw_total
         + 36
@@ -608,13 +679,14 @@ fn cmd_create_params_version_impl(
     if store_total < compressed_total {
         out.set_len(0)?;
         out.seek(SeekFrom::Start(0))?;
-        write_store_archive(&mut out, &files)?;
+        write_store_archive(&mut out, &files, dict)?;
         let total = out.stream_position()?;
         return Ok(CreateInfoJson {
             files: entries.len(),
             unique_chunks: 0,
             raw_bytes: raw_total,
             archive_bytes: total,
+            dict: dict.is_some(),
             store: true,
         });
     }
@@ -623,6 +695,7 @@ fn cmd_create_params_version_impl(
         unique_chunks: chunks.len(),
         raw_bytes: raw_total,
         archive_bytes: compressed_total,
+        dict: dict.is_some(),
         store: false,
     })
 }
@@ -937,10 +1010,14 @@ fn emit_parallel(
 
 /// STORE container (6B magic+version+mode, raw payload, standard footer).
 /// v2 table entry: path_len u16 | path | file_len u64 | blake3[32] of payload.
-fn write_store_archive(out: &mut File, files: &[(String, PathBuf)]) -> Result<()> {
+fn write_store_archive(out: &mut File, files: &[(String, PathBuf)], dict: Option<&dict::Dict>) -> Result<()> {
     out.write_all(MAGIC_STORE)?;
     write_u16(out, STORE_VERSION)?;
-    write_u16(out, STORE_MODE)?;
+    write_u16(out, if dict.is_some() { STORE_MODE_DICT } else { STORE_MODE })?;
+    if let Some(d) = dict {
+        out.write_all(&d.rule_hash)?;
+        write_u32(out, d.rules.len() as u32)?;
+    }
     let table_offset = out.stream_position()?;
     write_u64(out, files.len() as u64)?;
     for (arc_name, disk_path) in files {
@@ -978,6 +1055,7 @@ pub struct CreateInfoJson {
     pub raw_bytes: u64,
     pub archive_bytes: u64,
     pub store: bool,
+    pub dict: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -1034,6 +1112,8 @@ struct ArchiveIndex {
     store_mode: bool,
     store_payload: u64, // STORE: byte offset where the raw payload begins
     gcs: Vec<GcRecord>, // v3 grammar-GC records in stream order
+    dict_rule_hash: Option<[u8; 32]>, // v6: dictionary marker (rule hash)
+    dict_rules: Option<u32>,          // v6: dictionary marker (rule count)
 }
 
 fn read_u8(r: &mut impl Read) -> Result<u8> {
@@ -1064,7 +1144,7 @@ fn open_index(archive: &Path) -> Result<(File, ArchiveIndex)> {
         bail!("bad magic (not aahl)");
     }
     let ver = read_u16(&mut f)?;
-    if !(1..=5).contains(&ver) {
+    if !(1..=6).contains(&ver) {
         bail!("unsupported version {ver}");
     }
     let flags = read_u16(&mut f)?;
@@ -1118,6 +1198,9 @@ fn open_index(archive: &Path) -> Result<(File, ArchiveIndex)> {
     // carry compressed chunks; GC records are parsed, validated and stored
     // in stream order so extraction can apply them at the right boundary.
     let mut chunks = Vec::with_capacity(num_chunks);
+    let mut dict_seen = false;
+    let mut dict_rule_hash: Option<[u8; 32]> = None;
+    let mut dict_rules: Option<u32> = None;
     let mut gcs: Vec<GcRecord> = Vec::new();
     f.seek(SeekFrom::Start(header_len))?;
     if ver >= 3 {
@@ -1160,6 +1243,23 @@ fn open_index(archive: &Path) -> Result<(File, ArchiveIndex)> {
                         survivors,
                     });
                 }
+                RECORD_DICT => {
+                    if dict_seen || data_seen > 0 {
+                        bail!("dict record in the wrong position");
+                    }
+                    if body_len != 36 {
+                        bail!("corrupt dict record body");
+                    }
+                    let mut rh = [0u8; 32];
+                    f.read_exact(&mut rh)?;
+                    let n = read_u32(&mut f)?;
+                    if n as usize > dict::MAX_RULES {
+                        bail!("implausible dict rule count {n}");
+                    }
+                    dict_seen = true;
+                    dict_rule_hash = Some(rh);
+                    dict_rules = Some(n);
+                }
                 _ => bail!("unknown record kind {kind}"),
             }
         }
@@ -1183,6 +1283,14 @@ fn open_index(archive: &Path) -> Result<(File, ArchiveIndex)> {
         }
     }
 
+
+    // V6 fail-closed consistency: dict marker and flag must agree.
+    if flags & FLAG_DICT != 0 && dict_rule_hash.is_none() {
+        bail!("FLAG_DICT set but no dict record present");
+    }
+    if dict_rule_hash.is_some() && flags & FLAG_DICT == 0 {
+        bail!("dict record present but FLAG_DICT not set");
+    }
     f.seek(SeekFrom::Start(table_offset))?;
     let nfiles = read_u64(&mut f)? as usize;
     if nfiles != num_files {
@@ -1218,6 +1326,8 @@ fn open_index(archive: &Path) -> Result<(File, ArchiveIndex)> {
             store_mode: false,
             store_payload: 0,
             gcs,
+            dict_rule_hash,
+            dict_rules,
         },
     ))
 }
@@ -1237,9 +1347,19 @@ fn open_store(mut f: File, flen: u64) -> Result<(File, ArchiveIndex)> {
         bail!("unsupported store version {sver}");
     }
     let mode = read_u16(&mut f)?;
-    if mode != STORE_MODE {
-        bail!("unsupported store mode {mode}");
-    }
+    let (dict_rule_hash, dict_rules) = match mode {
+        STORE_MODE => (None, None),
+        STORE_MODE_DICT => {
+            let mut rh = [0u8; 32];
+            f.read_exact(&mut rh)?;
+            let n = read_u32(&mut f)?;
+            if n as usize > dict::MAX_RULES {
+                bail!("implausible dict rule count {n}");
+            }
+            (Some(rh), Some(n))
+        }
+        _ => bail!("unsupported store mode {mode}"),
+    };
 
     f.seek(SeekFrom::End(-(FOOTER_LEN as i64)))?;
     let mut fmagic = [0u8; 4];
@@ -1312,12 +1432,14 @@ fn open_store(mut f: File, flen: u64) -> Result<(File, ArchiveIndex)> {
         { f.seek(SeekFrom::Start(0))?; f },
         ArchiveIndex {
             version: STORE_VERSION,
-            flags: 0,
+            flags: if dict_rule_hash.is_some() { FLAG_DICT } else { 0 },
             chunk_size: 0,
             chunks: Vec::new(),
             files,
             store_mode: true,
             store_payload,
+            dict_rule_hash,
+            dict_rules,
             gcs: Vec::new(),
         },
     ))
@@ -1386,14 +1508,81 @@ fn cmd_list(archive: &Path, json: bool) -> Result<()> {
             println!("{:>12}  {:>6}  {}", e.file_len, e.refs.len(), e.path);
         }
         println!("{} files, {} unique chunks", idx.files.len(), idx.chunks.len());
+        if let Some(n) = idx.dict_rules {
+            println!("dictionary: {n} rules (pass --dict at extract/test)");
+        }
     }
     Ok(())
 }
 
+/// `aahl train`: build a grammar dictionary (.aahld) from sample files.
+fn cmd_train(
+    out_dict: &Path,
+    samples: &[PathBuf],
+    chunk_size: usize,
+    max_rules: usize,
+    min_benefit: i64,
+    json: bool,
+) -> Result<()> {
+    let rep = dict::train(
+        samples,
+        &dict::TrainOptions { chunk_size, max_rules, min_benefit },
+    )?;
+    dict::save(out_dict, &rep.rules, rep.sample_hash)?;
+    let rule_hash = dict::rule_hash_of(&rep.rules);
+    if json {
+        println!("{}", serde_json::json!({
+            "rules": rep.rules.len(),
+            "rule_hash": hex_of(&rule_hash),
+            "sample_hash": hex_of(&rep.sample_hash),
+            "raw_bytes": rep.raw_bytes,
+            "chunks_total": rep.chunks_total,
+            "chunks_kept": rep.chunks_kept,
+            "trimmed_by_benefit": rep.trimmed_by_benefit,
+            "file": out_dict.display().to_string(),
+        }));
+    } else {
+        println!(
+            "aahl: {} rules from {} bytes in {}/{} kept chunks -> {}",
+            rep.rules.len(),
+            rep.raw_bytes,
+            rep.chunks_kept,
+            rep.chunks_total,
+            out_dict.display()
+        );
+    }
+    Ok(())
+}
+
+/// Lowercase hex of a blake3 digest (JSON summaries).
+fn hex_of(b: &[u8; 32]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+
+/// V6 fail-closed gate: a dict-seeded archive requires the dict file; a dict
+/// file given for a plain archive is rejected; and the loaded dict must match
+/// the marker carried in the container (rule hash + count) exactly.
+fn resolve_dict(idx: &ArchiveIndex, dict_path: Option<&Path>) -> Result<Option<dict::Dict>> {
+    match (dict_path, idx.dict_rule_hash) {
+        (None, None) => Ok(None),
+        (Some(p), None) => bail!("{} is not dict-seeded (no matchable marker)", p.display()),
+        (None, Some(_)) => bail!("archive requires a dictionary (pass --dict DICT)"),
+        (Some(p), Some(rh)) => {
+            let d = dict::load(p)?;
+            if d.rule_hash != rh || d.rules.len() as u32 != idx.dict_rules.unwrap_or(0) {
+                bail!("dictionary does not match the archive marker (rule hash mismatch)");
+            }
+            Ok(Some(d))
+        }
+    }
+}
+
+
 /// Decode every chunk in index order and verify hashes/lengths (same codecs
 /// as extraction). Store containers were already fully verified at open time.
 /// Collects errors without aborting early so a full report is produced.
-fn verify_archive(f: &mut File, idx: &ArchiveIndex) -> Result<TestReportJson> {
+fn verify_archive(f: &mut File, idx: &ArchiveIndex, dict: Option<&dict::Dict>) -> Result<TestReportJson> {
     let mut errors: Vec<String> = Vec::new();
     if idx.store_mode {
         // open_store verified every payload slice (hash + length) at open.
@@ -1408,6 +1597,9 @@ fn verify_archive(f: &mut File, idx: &ArchiveIndex) -> Result<TestReportJson> {
         } else {
             grammar::PersistentGrammar::default()
         };
+        if let Some(d) = dict {
+            g.seed_rules(&d.rules)?;
+        }
         let mut gci = 0usize;
         'chunks: for (i, meta) in idx.chunks.iter().enumerate() {
             while gci < idx.gcs.len() && (idx.gcs[gci].data_before as usize) == i {
@@ -1465,9 +1657,10 @@ fn verify_archive(f: &mut File, idx: &ArchiveIndex) -> Result<TestReportJson> {
 }
 
 /// `aahl test <ARCHIVE>`: integrity check. Non-zero exit on any error.
-fn cmd_test(archive: &Path, json: bool) -> Result<()> {
+fn cmd_test(archive: &Path, dict_path: Option<&Path>, json: bool) -> Result<()> {
     let (mut f, idx) = open_index(archive)?;
-    let report = verify_archive(&mut f, &idx)?;
+    let dict = resolve_dict(&idx, dict_path)?;
+    let report = verify_archive(&mut f, &idx, dict.as_ref())?;
     if json {
         println!("{}", serde_json::to_string(&report)?);
     } else if report.ok {
@@ -1520,8 +1713,9 @@ fn safe_destination(out_dir: &Path, entry_path: &str) -> Result<PathBuf> {
     Ok(dest)
 }
 
-fn cmd_extract(archive: &Path, out_dir: &Path) -> Result<()> {
+fn cmd_extract(archive: &Path, out_dir: &Path, dict_path: Option<&Path>) -> Result<()> {
     let (mut f, idx) = open_index(archive)?;
+    let dict = resolve_dict(&idx, dict_path)?;
     std::fs::create_dir_all(out_dir)?;
 
     if idx.store_mode {
@@ -1552,6 +1746,9 @@ fn cmd_extract(archive: &Path, out_dir: &Path) -> Result<()> {
         } else {
             grammar::PersistentGrammar::default()
         };
+        if let Some(d) = dict.as_ref() {
+            g.seed_rules(&d.rules)?;
+        }
         let mut cache: HashMap<u32, Vec<u8>> = HashMap::with_capacity(idx.chunks.len());
         let mut gci = 0usize;
         for (i, meta) in idx.chunks.iter().enumerate() {
@@ -1628,6 +1825,7 @@ fn main() -> Result<()> {
             lag,
             gc_interval,
             jobs,
+            dict,
             par_stats,
             no_table,
             table_stats,
@@ -1639,14 +1837,15 @@ fn main() -> Result<()> {
             lag,
             gc_interval,
             jobs,
+            dict.as_deref(),
             par_stats.as_deref(),
             no_table,
             table_stats.as_deref(),
             json,
         ),
         Cmd::List { archive, json } => cmd_list(&archive, json),
-        Cmd::Extract { archive, out_dir } => cmd_extract(&archive, &out_dir),
-        Cmd::Test { archive, json } => cmd_test(&archive, json),
+        Cmd::Extract { archive, out_dir, dict } => cmd_extract(&archive, &out_dir, dict.as_deref()),
+        Cmd::Test { archive, json, dict } => cmd_test(&archive, dict.as_deref(), json),
         Cmd::BlockSize { input, sweep } => {
             let data = std::fs::read(&input).with_context(|| format!("read {}", input.display()))?;
             let (folded, arith, o1t, o1b, final_len, raw, mode) = aahl::block_sizes(&data);
@@ -1745,6 +1944,18 @@ fn main() -> Result<()> {
             ansbench::run_ans_bench(&inputs, &opts)?;
             Ok(())
         }
+        Cmd::Train {
+            out_dict,
+            samples,
+            chunk_size,
+            max_rules,
+            min_benefit,
+            json,
+        } => cmd_train(&out_dict, &samples, chunk_size, max_rules, min_benefit, json),
+        Cmd::RunBenchDict { set_dir, tsv, small_tsv, chunk_size, runs } => {
+            dictbench::run_dict_bench(&set_dir, &tsv, &small_tsv, chunk_size, runs)?;
+            Ok(())
+        }
     }
 }
 
@@ -1818,7 +2029,7 @@ mod container_tests {
         assert_eq!(idx.files[0].refs, idx.files[1].refs, "identical files must share refs");
         assert_eq!(idx.files[0].refs.len(), blocks_a);
         drop(f);
-        cmd_extract(&arc, &outd).unwrap();
+        cmd_extract(&arc, &outd, None).unwrap();
         for name in ["a.txt", "b.txt", "c.bin"] {
             let orig = std::fs::read(src.join(name)).unwrap();
             let got = std::fs::read(outd.join("src").join(name)).unwrap();
@@ -1916,7 +2127,7 @@ let (_f, idx) = open_index(&arc).unwrap();
         assert_eq!(idx.files.len(), 1);
         assert_eq!(idx.files[0].file_len, 0);
         let outd = dir.join("ex");
-        cmd_extract(&arc, &outd).unwrap();
+        cmd_extract(&arc, &outd, None).unwrap();
         assert_eq!(std::fs::read(outd.join("e.txt")).unwrap(), b"");
     }
 
@@ -1949,7 +2160,7 @@ let (_f, idx) = open_index(&arc).unwrap();
         }
 
         let outd = dir.join("extracted");
-        cmd_extract(&arc, &outd).unwrap();
+        cmd_extract(&arc, &outd, None).unwrap();
         let got = std::fs::read(outd.join("osc.txt").as_path()).unwrap();
         assert_eq!(got, data, "roundtrip mismatch across GC boundaries");
     }
@@ -2037,7 +2248,7 @@ let (_f, idx) = open_index(&arc).unwrap();
 
         // baseline sanity: a real archive opens and round-trips
         let baseline_out = dir.join("baseline");
-        cmd_extract(&arc, &baseline_out).unwrap();
+        cmd_extract(&arc, &baseline_out, None).unwrap();
         assert_eq!(
             std::fs::read(baseline_out.join("mix.bin")).unwrap(),
             data,
@@ -2094,7 +2305,7 @@ let (_f, idx) = open_index(&arc).unwrap();
             match open_index(&pmut) {
                 Ok((_f, idx)) => {
                     let outd = dir.join(format!("out{iter}"));
-                    if let Ok(()) = cmd_extract(&pmut, &outd) {
+                    if let Ok(()) = cmd_extract(&pmut, &outd, None) {
                         // any successful decode must be byte-exact
                         let got = std::fs::read(outd.join("mix.bin"))
                             .unwrap_or_else(|_| Vec::new());
@@ -2113,7 +2324,7 @@ let (_f, idx) = open_index(&arc).unwrap();
     #[test]
     fn store_mode_mutation_fuzz_never_panics() {
         // store v2 carries a per-file hash, so ANY corruption (metadata,
-        // footer, or raw payload) must be rejected on open â€” never a panic,
+        // footer, or raw payload) must be rejected on open Ã¢â‚¬â€ never a panic,
         // and never a silent wrong extraction.
         let dir = scratch("storefuzz");
         let src = dir.join("rand.bin");
@@ -2160,7 +2371,7 @@ let (_f, idx) = open_index(&arc).unwrap();
                     // open_index verified every payload hash, so a surviving
                     // store must extract the exact original (never a silent
                     // wrong payload) and never panic.
-                    cmd_extract(&pmut, &outd).unwrap();
+                    cmd_extract(&pmut, &outd, None).unwrap();
                     let got = std::fs::read(outd.join("rand.bin")).unwrap();
                     assert_eq!(got, data, "store corruption survived open at iter {iter}");
                     drop(idx);
@@ -2239,7 +2450,7 @@ let (_f, idx) = open_index(&arc).unwrap();
         assert_eq!(bs, bp1, "parallel (1 job) must match serial bytes");
         // and both must round-trip
         let extract = dir.join("x");
-        cmd_extract(&par16, &extract).unwrap();
+        cmd_extract(&par16, &extract, None).unwrap();
         let got = std::fs::read(extract.join("p.txt")).unwrap();
         assert_eq!(got, blob, "parallel archive must round-trip");
         let _ = dir;
@@ -2280,7 +2491,7 @@ let (_f, idx) = open_index(&arc).unwrap();
                     "byte identity failed lag={lag} gc={gc} (jobs 1 vs 8)"
                 );
                 let out = dir.join(format!("x_{lag}_{gc}"));
-                cmd_extract(dir.join(format!("l{lag}_g{gc}_j8.aahl")).as_path(), &out).unwrap();
+                cmd_extract(dir.join(format!("l{lag}_g{gc}_j8.aahl")).as_path(), &out, None).unwrap();
                 let got = std::fs::read(out.join("mix.txt")).unwrap();
                 assert_eq!(got, blob, "roundtrip failed lag={lag} gc={gc}");
             }
@@ -2392,7 +2603,7 @@ let (_f, idx) = open_index(&arc).unwrap();
         f.write_all(&1u64.to_le_bytes()).unwrap();
         drop(f);
 
-        let err = cmd_extract(&arc, &out).unwrap_err();
+        let err = cmd_extract(&arc, &out, None).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("unsafe") || msg.contains("escapes"), "msg: {msg}");
         assert!(
@@ -2426,6 +2637,7 @@ let (_f, idx) = open_index(&arc).unwrap();
             pack_params(1, 64, PARAM_RULES_DEFAULT, 0),
             1,
             4,
+            None,
         )
         .unwrap();
         cmd_create_params_version(
@@ -2435,6 +2647,7 @@ let (_f, idx) = open_index(&arc).unwrap();
             pack_params(1, 64, PARAM_RULES_DEFAULT, 0),
             1,
             3,
+            None,
         )
         .unwrap();
 
@@ -2456,7 +2669,7 @@ let (_f, idx) = open_index(&arc).unwrap();
 
         // both v3 (legacy read path) and v4 must extract byte-identically
         for (a, outd) in [(&arc4, dir.join("e4")), (&arc3, dir.join("e3"))] {
-            cmd_extract(a, &outd).unwrap();
+            cmd_extract(a, &outd, None).unwrap();
             let got = std::fs::read(outd.join("src").join("a.txt")).unwrap();
             assert_eq!(got, blob, "extract mismatch for {}", a.display());
         }
@@ -2471,10 +2684,10 @@ let (_f, idx) = open_index(&arc).unwrap();
         let arc = dir.join("v6.aahl");
         cmd_create(&arc, &[src], 4096, 1, 64, 1).unwrap();
         let mut bytes = std::fs::read(&arc).unwrap();
-        bytes[4..6].copy_from_slice(&6u16.to_le_bytes());
+        bytes[4..6].copy_from_slice(&7u16.to_le_bytes());
         let mut prefix = [0u8; 20];
         prefix[..4].copy_from_slice(&bytes[..4]);
-        prefix[4..6].copy_from_slice(&6u16.to_le_bytes());
+        prefix[4..6].copy_from_slice(&7u16.to_le_bytes());
         prefix[6..8].copy_from_slice(&bytes[6..8]);
         prefix[8..12].copy_from_slice(&bytes[8..12]);
         prefix[12..20].copy_from_slice(&bytes[12..20]);
@@ -2515,6 +2728,7 @@ let (_f, idx) = open_index(&arc).unwrap();
             pack_params(16, 64, PARAM_RULES_DEFAULT, 0),
             1,
             4,
+            None,
         )
         .unwrap();
         cmd_create_params_version(
@@ -2524,6 +2738,7 @@ let (_f, idx) = open_index(&arc).unwrap();
             pack_params(16, 64, PARAM_RULES_DEFAULT, 0),
             1,
             3,
+            None,
         )
         .unwrap();
 
@@ -2533,7 +2748,7 @@ let (_f, idx) = open_index(&arc).unwrap();
             len4 < len3,
             "v4 exact contexts must beat v3 when hot rules dominate: v3={len3}B v4={len4}B"
         );
-        cmd_extract(&arc4, &dir.join("e4")).unwrap();
+        cmd_extract(&arc4, &dir.join("e4"), None).unwrap();
         let got = std::fs::read(dir.join("e4").join("src").join("a.txt")).unwrap();
         assert_eq!(got, blob);
     }
@@ -2556,7 +2771,7 @@ let (_f, idx) = open_index(&arc).unwrap();
         let arc = dir.join("out.aahl");
         cmd_create(&arc, &[src.clone()], 4096, 1, 64, 1).unwrap();
         // must not return Err, must not print FAIL
-        cmd_test(&arc, false).unwrap();
+        cmd_test(&arc, None, false).unwrap();
     }
 
     #[test]
@@ -2573,7 +2788,7 @@ let (_f, idx) = open_index(&arc).unwrap();
         cmd_create(&arc, &[src.clone()], 4096, 1, 64, 1).unwrap();
         let (_f, idx) = open_index(&arc).unwrap();
         assert!(idx.store_mode);
-        cmd_test(&arc, false).unwrap();
+        cmd_test(&arc, None, false).unwrap();
     }
 
     #[test]
@@ -2599,14 +2814,14 @@ let (_f, idx) = open_index(&arc).unwrap();
         let p = dir.join("flip.aahl");
         std::fs::write(&p, &flipped).unwrap();
         assert!(
-            cmd_test(&p, false).is_err(),
+            cmd_test(&p, None, false).is_err(),
             "payload corruption must fail integrity test"
         );
         // truncation mid-payload must fail too
         let cut = good.len() / 2;
         let p = dir.join("trunc.aahl");
         std::fs::write(&p, &good[..cut]).unwrap();
-        assert!(cmd_test(&p, false).is_err(), "truncation must fail integrity test");
+        assert!(cmd_test(&p, None, false).is_err(), "truncation must fail integrity test");
     }
 
     #[test]
@@ -2621,7 +2836,7 @@ let (_f, idx) = open_index(&arc).unwrap();
         // capture stdout via a pipe is heavy; instead test the pure report
         // builder by re-running open+verify through the same code path.
         let (mut f, idx) = open_index(&arc).unwrap();
-        let rep = verify_archive(&mut f, &idx).unwrap();
+        let rep = verify_archive(&mut f, &idx, None).unwrap();
         assert!(rep.errors.is_empty());
         let ser = serde_json::to_string(&rep).unwrap();
         let v: serde_json::Value = serde_json::from_str(&ser).unwrap();
@@ -2660,7 +2875,7 @@ let (_f, idx) = open_index(&arc).unwrap();
         std::fs::write(&p, &tampered).unwrap();
         let (mut f, idx) = open_index(&p).unwrap();
         assert_eq!(idx.files[0].file_len, u64::MAX / 2);
-        let rep = verify_archive(&mut f, &idx).unwrap();
+        let rep = verify_archive(&mut f, &idx, None).unwrap();
         assert!(!rep.errors.is_empty(), "refs/len mismatch must be reported");
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&rep).unwrap()).unwrap();

@@ -1,4 +1,4 @@
-﻿//! Persistent cross-block grammar.
+//! Persistent cross-block grammar.
 //!
 //! The core problem this module attacks: `aahl::compress_block` is stateless â€”
 //! each 64 KiB chunk is folded and coded in isolation, so a phrase defined in
@@ -305,6 +305,57 @@ impl PersistentGrammar {
     /// invalidate its frozen prefix).
     pub fn rules_len(&self) -> usize {
         self.rules.len()
+    }
+
+    /// The live rule table (id = 256 + index, in creation order). Read access
+    /// for dictionary training (`aahl train`).
+    pub fn rules(&self) -> &[(u16, u16)] {
+        &self.rules
+    }
+
+    /// Seed the persistent grammar with a closed rule table before any chunk is
+    /// processed (V6 dictionaries). Must be called on a FRESH grammar (no rules
+    /// yet); encoder and decoder seed the same table, so definitions are never
+    /// retransmitted. Validation mirrors G-block decoding: rule i may reference
+    /// only ids < 256 + i, and the count must fit the alphabet cap.
+    pub fn seed_rules(&mut self, rules: &[(u16, u16)]) -> Result<()> {
+        if !self.rules.is_empty() {
+            bail!("seed_rules requires a fresh grammar");
+        }
+        if rules.len() > MAX_SYMS - 256 {
+            bail!("too many seed rules ({} > {})", rules.len(), MAX_SYMS - 256);
+        }
+        for (i, &(l, r)) in rules.iter().enumerate() {
+            let new_id = 256 + i;
+            if (l as usize) >= new_id || (r as usize) >= new_id {
+                bail!("forward grammar reference in seed rule {i} ({l},{r})");
+            }
+        }
+        self.rules.extend_from_slice(rules);
+        self.last_use.resize(self.rules.len(), 0);
+        self.staged_pairs.clear();
+        self.rules_before = self.rules.len();
+        self.epoch_base_len = self.rules.len();
+        self.snapshot_lens.clear();
+
+        let n2 = 256 + self.rules.len();
+        self.model.grow(n2);
+
+        // Rebuild the encoder indexes so reuse/invent see the seeds (same shape
+        // as apply_gc's re-anchor after a remap).
+        self.pair_index.clear();
+        self.trie = PhraseTrie::new();
+        for i in 0..self.rules.len() {
+            let (l, r) = self.rules[i];
+            let id = (256 + i) as u16;
+            self.pair_index.insert(((l as u32) << 16) | r as u32, id);
+            if let Some(bytes) = self.rule_bytes(i, MAX_PHRASE) {
+                if bytes.len() >= 2 {
+                    self.trie.insert(&bytes, id);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Byte expansion of rule at index `idx`. Returns None if the expansion is

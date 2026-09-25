@@ -216,3 +216,5 @@ Codec + methodology + full numbers: see `docs/ANS-EXPERIMENT.md`.
 normalization regression inside `normalization_properties`). All byte-
 determinism, corruption-rejection, round-trip, legacy-read tests still green.
 Pre-existing unrelated warnings unchanged.
+
+[x] V6 STEP 4 **grammar-seeded dictionary (train/create/extract/test --dict)** — cli `train` + `create/extract/test --dict` seam, RECORD_DICT header records (fail-closed: dict archive w/o --dict fails, plain archive w/ --dict fails), 136 dict+roundtrip tests green; smoke: train/create/extract/test roundtrip exit 0, test --dict "2 files verified OK", every no-dict/plain+wrong-dict branch exit≠0 (see docs/DICT-EXPERIMENT.md).
